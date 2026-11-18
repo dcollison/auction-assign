@@ -111,6 +111,20 @@ print(res.row_ind, res.col_ind, res.cost)
 
 Note: Pairs with `cost == cost_limit` are excluded (strict `< cost_limit` when minimizing, strict `> cost_limit` when maximizing). `NaN`, `-inf` during minimization, and `+inf` during maximization raise `ValueError`.
 
+## Benchmarks
+
+Compare `auction_assign` against `scipy.optimize.linear_sum_assignment` on dense random matrices (`N = 20, 50, 100, 250, 500`, plus `50x200`) and feasible sparse-gated track-fusion matrices (90% `inf` entries, with a `1e15` sentinel for SciPy):
+
+```bash
+# Full benchmark table with median/min timings and optimality gap checks
+uv run python benchmarks/bench_assign.py
+
+# Fast verification run (fewer warmup/repeat iterations)
+uv run python benchmarks/bench_assign.py --quick
+```
+
+Both modes verify solution optimality against SciPy for every benchmark case (`PASS`/`FAIL`).
+
 ## Local Development
 
 ```bash
@@ -127,8 +141,8 @@ cargo test
 
 # Run Python lint, format check, and strict type checking
 uv run ruff check .
-uv run ruff format --check python tests
-uv run mypy python tests
+uv run ruff format --check python tests benchmarks
+uv run mypy python tests benchmarks
 
 # Build wheel and sdist into dist/
 uv build
