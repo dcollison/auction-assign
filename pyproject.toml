@@ -23,6 +23,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Mathematics",
 ]
 
+[project.urls]
+Homepage = "https://github.com/dcollison/auction-assign"
+Repository = "https://github.com/dcollison/auction-assign"
+Issues = "https://github.com/dcollison/auction-assign/issues"
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",

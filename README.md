@@ -156,7 +156,7 @@ One-time repository and PyPI setup:
 
 1. In your GitHub repository, go to **Settings → Environments** and create an environment named `release` (optionally configure required reviewers or branch/tag protection rules).
 2. On [PyPI](https://pypi.org/), go to **Your Account → Publishing** (or your project's **Publishing** settings) and add a **GitHub** Trusted Publisher with:
-   - **Owner**: your GitHub user or organization
+   - **Owner**: `dcollison`
    - **Repository name**: `auction-assign`
    - **Workflow name**: `release.yml`
    - **Environment name**: `release`
