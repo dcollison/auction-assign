@@ -1,22 +1,24 @@
 [build-system]
-requires = ["maturin>=1.7,<2.0"]
+requires = ["maturin>=1.9,<2.0"]
 build-backend = "maturin"
 
 [project]
 name = "auction-assign"
 version = "0.1.0"
 description = "Fast Bertsekas auction algorithm for linear sum assignment in Rust with Python bindings"
+readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
+license-files = ["LICENSE"]
 dependencies = ["numpy>=1.24"]
 classifiers = [
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Mathematics",
 ]
@@ -28,7 +30,7 @@ dev = [
     "scipy>=1.11",
     "ruff>=0.8",
     "mypy>=1.13",
-    "maturin>=1.7,<2.0",
+    "maturin>=1.9,<2.0",
 ]
 
 [tool.maturin]
