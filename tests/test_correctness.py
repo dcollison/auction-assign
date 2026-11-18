@@ -350,9 +350,15 @@ def test_core_direct_non_c_contiguous_and_unaligned() -> None:
     assert cost == pytest.approx(float(f_view[row_ind, col_ind].sum()))
     assert cost == pytest.approx(4.0)
 
-    # Unaligned view passed directly to _core must raise ValueError cleanly rather than UB
+    # Unaligned views passed directly to _core must raise ValueError cleanly rather than UB
     buf = bytearray(8 * 4 + 1)
     unaligned = np.ndarray((2, 2), dtype=np.float64, buffer=buf, offset=1)
     unaligned[:] = [[1.0, 2.0], [3.0, 4.0]]
     with pytest.raises(ValueError, match="aligned"):
         auction_assign._core.solve_dense(unaligned)
+
+    unaligned_non_c = unaligned.T
+    assert not unaligned_non_c.flags.c_contiguous
+    assert not unaligned_non_c.flags.aligned
+    with pytest.raises(ValueError, match=r"^cost matrix must be aligned$"):
+        auction_assign._core.solve_dense(unaligned_non_c)

@@ -83,9 +83,7 @@ fn solve_dense<'py>(
         owned_buf = costs.as_array().iter().copied().collect();
         &owned_buf
     } else {
-        return Err(PyValueError::new_err(
-            "cost matrix must be aligned and C-contiguous",
-        ));
+        return Err(PyValueError::new_err("cost matrix must be aligned"));
     };
 
     let config = SolveConfig {

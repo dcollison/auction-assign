@@ -71,10 +71,10 @@ jobs:
         run: uv run ruff check .
 
       - name: Check ruff formatting
-        run: uv run ruff format --check python tests
+        run: uv run ruff format --check python tests benchmarks
 
       - name: Run mypy
-        run: uv run mypy python tests
+        run: uv run mypy python tests benchmarks
 
       - name: Run pytest
         run: uv run pytest -v
