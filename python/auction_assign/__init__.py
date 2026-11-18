@@ -96,7 +96,9 @@ def _coerce_optional_float(name: str, value: float | None) -> float | None:
 def _coerce_max_iterations(value: int | None) -> int | None:
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"max_iterations must be an integer > 0, not bool ({value!r})")
+    if not isinstance(value, (int, np.integer)):
         raise TypeError(f"max_iterations must be an integer or None, got {type(value).__name__}")
     parsed = int(value)
     if parsed <= 0:

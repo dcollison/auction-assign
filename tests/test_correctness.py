@@ -186,10 +186,14 @@ def test_validation_errors() -> None:
     for bad_iter in (0, -1, -100):
         with pytest.raises(ValueError, match="max_iterations"):
             solve(valid, max_iterations=bad_iter)
-    with pytest.raises(TypeError):
+    with pytest.raises(ValueError, match="max_iterations"):
         solve(valid, max_iterations=True)
-    with pytest.raises(TypeError):
+    with pytest.raises(ValueError, match="max_iterations"):
         solve(valid, max_iterations=False)
+    with pytest.raises(ValueError, match="max_iterations"):
+        solve(valid, max_iterations=np.bool_(True))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="max_iterations"):
+        solve(valid, max_iterations=np.bool_(False))  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         solve(valid, max_iterations=1.5)  # type: ignore[arg-type]
 
