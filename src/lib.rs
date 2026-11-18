@@ -55,22 +55,21 @@ fn map_solver_error(err: SolverError) -> PyErr {
     }
 }
 
-#[pyfunction]
-#[pyo3(signature = (costs, maximize = false, cost_limit = None, eps_min = None, eps_factor = 5.0, max_iterations = None))]
-fn solve_dense<'py>(
-    py: Python<'py>,
-    costs: PyReadonlyArray2<'py, f64>,
+type AssignDenseOutput<'py> = (Bound<'py, PyArray1<isize>>, Bound<'py, PyArray1<isize>>);
+
+fn extract_costs_and_config<'py>(
+    costs: &'py PyReadonlyArray2<'py, f64>,
+    owned_buf: &'py mut Vec<f64>,
     maximize: bool,
     cost_limit: Option<f64>,
     eps_min: Option<f64>,
     eps_factor: f64,
     max_iterations: Option<usize>,
-) -> PyResult<SolveDenseOutput<'py>> {
+) -> PyResult<(&'py [f64], usize, usize, SolveConfig)> {
     let shape = costs.shape();
     let n_rows = shape[0];
     let n_cols = shape[1];
 
-    let owned_buf: Vec<f64>;
     let costs_slice: &[f64] = if n_rows == 0 || n_cols == 0 {
         &[]
     } else if costs.is_c_contiguous() {
@@ -80,8 +79,8 @@ fn solve_dense<'py>(
             ))
         })?
     } else if costs.is_aligned() {
-        owned_buf = costs.as_array().iter().copied().collect();
-        &owned_buf
+        *owned_buf = costs.as_array().iter().copied().collect();
+        owned_buf.as_slice()
     } else {
         return Err(PyValueError::new_err("cost matrix must be aligned"));
     };
@@ -93,6 +92,61 @@ fn solve_dense<'py>(
         eps_factor,
         max_iterations,
     };
+    Ok((costs_slice, n_rows, n_cols, config))
+}
+
+#[pyfunction]
+#[pyo3(signature = (costs, maximize = false, cost_limit = None, eps_min = None, eps_factor = 5.0, max_iterations = None))]
+fn assign_dense<'py>(
+    py: Python<'py>,
+    costs: PyReadonlyArray2<'py, f64>,
+    maximize: bool,
+    cost_limit: Option<f64>,
+    eps_min: Option<f64>,
+    eps_factor: f64,
+    max_iterations: Option<usize>,
+) -> PyResult<AssignDenseOutput<'py>> {
+    let mut owned_buf = Vec::new();
+    let (costs_slice, n_rows, n_cols, config) = extract_costs_and_config(
+        &costs,
+        &mut owned_buf,
+        maximize,
+        cost_limit,
+        eps_min,
+        eps_factor,
+        max_iterations,
+    )?;
+
+    let (raw_rows, raw_cols) = py
+        .detach(|| solver::assign_dense(costs_slice, n_rows, n_cols, &config))
+        .map_err(map_solver_error)?;
+
+    let row_ind = usize_vec_to_isize(raw_rows, "row")?;
+    let col_ind = usize_vec_to_isize(raw_cols, "column")?;
+    Ok((row_ind.into_pyarray(py), col_ind.into_pyarray(py)))
+}
+
+#[pyfunction]
+#[pyo3(signature = (costs, maximize = false, cost_limit = None, eps_min = None, eps_factor = 5.0, max_iterations = None))]
+fn solve_dense<'py>(
+    py: Python<'py>,
+    costs: PyReadonlyArray2<'py, f64>,
+    maximize: bool,
+    cost_limit: Option<f64>,
+    eps_min: Option<f64>,
+    eps_factor: f64,
+    max_iterations: Option<usize>,
+) -> PyResult<SolveDenseOutput<'py>> {
+    let mut owned_buf = Vec::new();
+    let (costs_slice, n_rows, n_cols, config) = extract_costs_and_config(
+        &costs,
+        &mut owned_buf,
+        maximize,
+        cost_limit,
+        eps_min,
+        eps_factor,
+        max_iterations,
+    )?;
 
     let output = py
         .detach(|| solver::solve_dense(costs_slice, n_rows, n_cols, &config))
@@ -123,6 +177,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "_CoreConvergenceError",
         m.py().get_type::<_CoreConvergenceError>(),
     )?;
+    m.add_function(wrap_pyfunction!(assign_dense, m)?)?;
     m.add_function(wrap_pyfunction!(solve_dense, m)?)?;
     Ok(())
 }

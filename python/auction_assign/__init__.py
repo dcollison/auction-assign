@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numbers
 from dataclasses import dataclass
+from typing import NoReturn
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -68,6 +69,14 @@ class AuctionResult:
 
 
 def _coerce_cost_matrix(cost_matrix: ArrayLike) -> NDArray[np.float64]:
+    if (
+        isinstance(cost_matrix, np.ndarray)
+        and cost_matrix.ndim == 2
+        and cost_matrix.dtype == np.float64
+        and cost_matrix.flags.c_contiguous
+        and cost_matrix.flags.aligned
+    ):
+        return cost_matrix
     raw = np.asarray(cost_matrix)
     if raw.ndim != 2:
         raise ValueError(
@@ -106,6 +115,42 @@ def _coerce_max_iterations(value: int | None) -> int | None:
     return parsed
 
 
+def _prepare_inputs(
+    cost_matrix: ArrayLike,
+    maximize: bool,
+    cost_limit: float | None,
+    eps_min: float | None,
+    eps_factor: float,
+    max_iterations: int | None,
+) -> tuple[NDArray[np.float64], bool, float | None, float | None, float, int | None]:
+    if type(maximize) is not bool and not isinstance(maximize, (bool, np.bool_)):
+        raise TypeError(f"maximize must be a bool, got {type(maximize).__name__}")
+    arr = _coerce_cost_matrix(cost_matrix)
+    limit_val = None if cost_limit is None else _coerce_float("cost_limit", cost_limit)
+    eps_min_val = None if eps_min is None else _coerce_float("eps_min", eps_min)
+    eps_factor_val = (
+        5.0
+        if eps_factor == 5.0 and type(eps_factor) is float
+        else _coerce_float("eps_factor", eps_factor)
+    )
+    max_iter_val = None if max_iterations is None else _coerce_max_iterations(max_iterations)
+    return (arr, bool(maximize), limit_val, eps_min_val, eps_factor_val, max_iter_val)
+
+
+def _raise_mapped_core_error(exc: BaseException) -> NoReturn:
+    if isinstance(exc, _core._CoreInfeasibleError):
+        msg = str(exc.args[0]) if exc.args else str(exc)
+        raise InfeasibleError(msg) from None
+    if isinstance(exc, _core._CoreConvergenceError):
+        msg, iterations_err, final_eps_err = exc.args
+        raise ConvergenceError(
+            str(msg),
+            iterations=int(iterations_err),
+            final_eps=float(final_eps_err),
+        ) from None
+    raise exc
+
+
 def solve(
     cost_matrix: ArrayLike,
     *,
@@ -116,13 +161,9 @@ def solve(
     max_iterations: int | None = None,
 ) -> AuctionResult:
     """Solve a 2D linear sum assignment problem and return indices, cost, and diagnostics."""
-    if not isinstance(maximize, (bool, np.bool_)):
-        raise TypeError(f"maximize must be a bool, got {type(maximize).__name__}")
-    arr = _coerce_cost_matrix(cost_matrix)
-    limit_val = _coerce_optional_float("cost_limit", cost_limit)
-    eps_min_val = _coerce_optional_float("eps_min", eps_min)
-    eps_factor_val = _coerce_float("eps_factor", eps_factor)
-    max_iter_val = _coerce_max_iterations(max_iterations)
+    arr, max_flag, limit_val, eps_min_val, eps_factor_val, max_iter_val = _prepare_inputs(
+        cost_matrix, maximize, cost_limit, eps_min, eps_factor, max_iterations
+    )
 
     try:
         (
@@ -136,22 +177,14 @@ def solve(
             col_prices,
         ) = _core.solve_dense(
             arr,
-            maximize=bool(maximize),
+            maximize=max_flag,
             cost_limit=limit_val,
             eps_min=eps_min_val,
             eps_factor=eps_factor_val,
             max_iterations=max_iter_val,
         )
-    except _core._CoreInfeasibleError as exc:
-        msg = str(exc.args[0]) if exc.args else str(exc)
-        raise InfeasibleError(msg) from None
-    except _core._CoreConvergenceError as exc:
-        msg, iterations_err, final_eps_err = exc.args
-        raise ConvergenceError(
-            str(msg),
-            iterations=int(iterations_err),
-            final_eps=float(final_eps_err),
-        ) from None
+    except (_core._CoreInfeasibleError, _core._CoreConvergenceError) as exc:
+        _raise_mapped_core_error(exc)
 
     return AuctionResult(
         row_ind=row_ind,
@@ -177,12 +210,18 @@ def auction_assign(
     max_iterations: int | None = None,
 ) -> tuple[NDArray[np.intp], NDArray[np.intp]]:
     """Solve a 2D linear sum assignment problem and return ``(row_ind, col_ind)``."""
-    result = solve(
-        cost_matrix,
-        maximize=maximize,
-        cost_limit=cost_limit,
-        eps_min=eps_min,
-        eps_factor=eps_factor,
-        max_iterations=max_iterations,
+    arr, max_flag, limit_val, eps_min_val, eps_factor_val, max_iter_val = _prepare_inputs(
+        cost_matrix, maximize, cost_limit, eps_min, eps_factor, max_iterations
     )
-    return (result.row_ind, result.col_ind)
+
+    try:
+        return _core.assign_dense(
+            arr,
+            maximize=max_flag,
+            cost_limit=limit_val,
+            eps_min=eps_min_val,
+            eps_factor=eps_factor_val,
+            max_iterations=max_iter_val,
+        )
+    except (_core._CoreInfeasibleError, _core._CoreConvergenceError) as exc:
+        _raise_mapped_core_error(exc)

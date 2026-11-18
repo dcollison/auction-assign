@@ -93,12 +93,56 @@ enum AssignmentMode {
     Empty,
 }
 
+/// Compact row-major CSR representation for matrices with forbidden (`inf`) or sparse partial entries.
+struct CsrMatrix {
+    offsets: Vec<usize>,
+    indices: Vec<usize>,
+    vals: Vec<f64>,
+}
+
+impl CsrMatrix {
+    /// Builds a transposed CSR matrix (column-major adjacency for reverse bidding) in `O(nnz + n)`.
+    fn transpose(&self, m: usize, n: usize) -> Self {
+        let mut counts = vec![0usize; n + 1];
+        for &col in &self.indices {
+            counts[col + 1] += 1;
+        }
+        for c in 0..n {
+            counts[c + 1] += counts[c];
+        }
+        let nnz = self.indices.len();
+        let mut t_indices = vec![0usize; nnz];
+        let mut t_vals = vec![0.0f64; nnz];
+        let mut cursor = counts[..n].to_vec();
+
+        for row in 0..m {
+            for pos in self.offsets[row]..self.offsets[row + 1] {
+                let col = self.indices[pos];
+                let dst = cursor[col];
+                t_indices[dst] = row;
+                t_vals[dst] = self.vals[pos];
+                cursor[col] = dst + 1;
+            }
+        }
+
+        Self {
+            offsets: counts,
+            indices: t_indices,
+            vals: t_vals,
+        }
+    }
+}
+
+enum BenefitStorage {
+    Dense(Vec<f64>),
+    Sparse(CsrMatrix),
+}
+
 struct NormalizedBenefits {
-    benefits: Vec<f64>,
+    storage: BenefitStorage,
     m: usize,
     n: usize,
     transposed: bool,
-    has_forbidden: bool,
     b_shift: f64,
     scale: f64,
     half_spread: f64,
@@ -106,7 +150,8 @@ struct NormalizedBenefits {
 }
 
 struct AuctionState<'a> {
-    benefits: &'a [f64],
+    storage: &'a BenefitStorage,
+    sparse_cols: Option<CsrMatrix>,
     m: usize,
     n: usize,
     pi: Vec<f64>,
@@ -187,12 +232,12 @@ fn validate_inputs(
     Ok(())
 }
 
-/// Returns `true` iff an `m x n` (`m <= n`) boolean bipartite adjacency matrix admits a matching of size `m`.
-fn has_complete_bipartite_matching(feasible: &[bool], m: usize, n: usize) -> bool {
+/// Returns `true` iff an `m x n` (`m <= n`) CSR bipartite adjacency admits a matching of size `m`.
+fn has_complete_bipartite_matching_csr(csr: &CsrMatrix, m: usize, n: usize) -> bool {
     if m == 0 {
         return true;
     }
-    if m > n || feasible.len() != m * n {
+    if m > n {
         return false;
     }
 
@@ -200,19 +245,15 @@ fn has_complete_bipartite_matching(feasible: &[bool], m: usize, n: usize) -> boo
     let mut col_reachable = vec![false; n];
     let mut reachable_cols = 0usize;
     for i in 0..m {
-        let row_off = i * n;
-        let mut row_ok = false;
-        for j in 0..n {
-            if feasible[row_off + j] {
-                row_ok = true;
-                if !col_reachable[j] {
-                    col_reachable[j] = true;
-                    reachable_cols += 1;
-                }
-            }
-        }
-        if !row_ok {
+        let cols = &csr.indices[csr.offsets[i]..csr.offsets[i + 1]];
+        if cols.is_empty() {
             return false;
+        }
+        for &j in cols {
+            if !col_reachable[j] {
+                col_reachable[j] = true;
+                reachable_cols += 1;
+            }
         }
     }
     if reachable_cols < m {
@@ -225,11 +266,10 @@ fn has_complete_bipartite_matching(feasible: &[bool], m: usize, n: usize) -> boo
 
     // Greedy initial matching to shrink the number of Hopcroft-Karp BFS phases.
     for (u, pair_slot) in pair_u.iter_mut().enumerate() {
-        let row_off = u * n;
-        for (v, col_slot) in pair_v.iter_mut().enumerate() {
-            if feasible[row_off + v] && *col_slot == NONE {
+        for &v in &csr.indices[csr.offsets[u]..csr.offsets[u + 1]] {
+            if pair_v[v] == NONE {
                 *pair_slot = v;
-                *col_slot = u;
+                pair_v[v] = u;
                 matched += 1;
                 break;
             }
@@ -245,7 +285,6 @@ fn has_complete_bipartite_matching(feasible: &[bool], m: usize, n: usize) -> boo
     let mut stack: Vec<(usize, usize)> = Vec::with_capacity(m);
 
     loop {
-        // BFS builds layered shortest-augmenting-path graph from unmatched rows.
         queue.clear();
         let mut dist_nil = usize::MAX;
         for u in 0..m {
@@ -261,12 +300,8 @@ fn has_complete_bipartite_matching(feasible: &[bool], m: usize, n: usize) -> boo
             if dist[u] >= dist_nil {
                 continue;
             }
-            let row_off = u * n;
             let next_dist = dist[u] + 1;
-            for v in 0..n {
-                if !feasible[row_off + v] {
-                    continue;
-                }
+            for &v in &csr.indices[csr.offsets[u]..csr.offsets[u + 1]] {
                 let next_u = pair_v[v];
                 if next_u == NONE {
                     dist_nil = next_dist;
@@ -281,7 +316,6 @@ fn has_complete_bipartite_matching(feasible: &[bool], m: usize, n: usize) -> boo
             return matched == m;
         }
 
-        // Iterative Dinic-style DFS over layered graph finds vertex-disjoint augmenting paths.
         cur.fill(0);
         for start_u in 0..m {
             if pair_u[start_u] != NONE {
@@ -292,15 +326,13 @@ fn has_complete_bipartite_matching(feasible: &[bool], m: usize, n: usize) -> boo
             let mut augmented = false;
 
             while let Some(&(u, _)) = stack.last() {
-                let row_off = u * n;
+                let row_start = csr.offsets[u];
+                let row_len = csr.offsets[u + 1] - row_start;
                 let mut pushed_or_found = false;
 
-                while cur[u] < n {
-                    let v = cur[u];
+                while cur[u] < row_len {
+                    let v = csr.indices[row_start + cur[u]];
                     cur[u] += 1;
-                    if !feasible[row_off + v] {
-                        continue;
-                    }
                     let next_u = pair_v[v];
                     if next_u == NONE {
                         if dist[u] + 1 == dist_nil {
@@ -342,7 +374,37 @@ fn has_complete_bipartite_matching(feasible: &[bool], m: usize, n: usize) -> boo
     }
 }
 
-/// Converts input costs into an `m <= n` row-major benefit matrix with global offset normalization.
+#[cfg(test)]
+fn has_complete_bipartite_matching(feasible: &[bool], m: usize, n: usize) -> bool {
+    if m == 0 {
+        return true;
+    }
+    if m > n || feasible.len() != m * n {
+        return false;
+    }
+    let mut offsets = Vec::with_capacity(m + 1);
+    let mut indices = Vec::new();
+    offsets.push(0);
+    for i in 0..m {
+        for j in 0..n {
+            if feasible[i * n + j] {
+                indices.push(j);
+            }
+        }
+        offsets.push(indices.len());
+    }
+    has_complete_bipartite_matching_csr(
+        &CsrMatrix {
+            offsets,
+            indices,
+            vals: Vec::new(),
+        },
+        m,
+        n,
+    )
+}
+
+/// Converts input costs into an `m <= n` benefit representation (dense slice when all finite, CSR when `inf`-gated).
 fn build_complete_benefits(
     costs: &[f64],
     n_rows: usize,
@@ -356,40 +418,29 @@ fn build_complete_benefits(
         (n_rows, n_cols)
     };
 
-    let mut benefits = vec![f64::NEG_INFINITY; m * n];
     let mut has_forbidden = false;
     let mut b_min = f64::INFINITY;
     let mut b_max = f64::NEG_INFINITY;
     let mut max_abs_b = 0.0f64;
+    let mut nnz = 0usize;
 
-    for r in 0..n_rows {
-        for c in 0..n_cols {
-            let val = costs[r * n_cols + c];
-            let (i, j) = if transposed { (c, r) } else { (r, c) };
-            let benefit = if maximize {
-                if val == f64::NEG_INFINITY {
-                    has_forbidden = true;
-                    f64::NEG_INFINITY
-                } else {
-                    val
-                }
-            } else if val == f64::INFINITY {
-                has_forbidden = true;
-                f64::NEG_INFINITY
-            } else {
-                -val
-            };
-
-            benefits[i * n + j] = benefit;
-            if benefit.is_finite() {
-                b_min = b_min.min(benefit);
-                b_max = b_max.max(benefit);
-                max_abs_b = max_abs_b.max(benefit.abs());
-            }
+    for &val in costs {
+        let forbidden = if maximize {
+            val == f64::NEG_INFINITY
+        } else {
+            val == f64::INFINITY
+        };
+        if forbidden {
+            has_forbidden = true;
+        } else {
+            let b = if maximize { val } else { -val };
+            b_min = b_min.min(b);
+            b_max = b_max.max(b);
+            max_abs_b = max_abs_b.max(b.abs());
+            nnz += 1;
         }
     }
 
-    // Shift out large uniform offsets while preserving 0 in-range matrices untouched.
     let b_shift = if b_min > 0.0 {
         b_min
     } else if b_max < 0.0 {
@@ -397,13 +448,65 @@ fn build_complete_benefits(
     } else {
         0.0
     };
-    if b_shift != 0.0 && b_shift.is_finite() {
-        for b in &mut benefits {
-            if b.is_finite() {
-                *b -= b_shift;
+    let shift = if b_shift != 0.0 && b_shift.is_finite() {
+        b_shift
+    } else {
+        0.0
+    };
+
+    let storage = if !has_forbidden {
+        let mut benefits = Vec::with_capacity(m * n);
+        if !transposed {
+            if maximize {
+                if shift == 0.0 {
+                    benefits.extend_from_slice(costs);
+                } else {
+                    benefits.extend(costs.iter().map(|&v| v - shift));
+                }
+            } else if shift == 0.0 {
+                benefits.extend(costs.iter().map(|&v| -v));
+            } else {
+                benefits.extend(costs.iter().map(|&v| -v - shift));
+            }
+        } else {
+            for i in 0..m {
+                for j in 0..n {
+                    let v = costs[j * n_cols + i];
+                    benefits.push((if maximize { v } else { -v }) - shift);
+                }
             }
         }
-    }
+        BenefitStorage::Dense(benefits)
+    } else {
+        let mut offsets = Vec::with_capacity(m + 1);
+        let mut indices = Vec::with_capacity(nnz);
+        let mut vals = Vec::with_capacity(nnz);
+        offsets.push(0);
+        for i in 0..m {
+            for j in 0..n {
+                let raw = if transposed {
+                    costs[j * n_cols + i]
+                } else {
+                    costs[i * n_cols + j]
+                };
+                let forbidden = if maximize {
+                    raw == f64::NEG_INFINITY
+                } else {
+                    raw == f64::INFINITY
+                };
+                if !forbidden {
+                    indices.push(j);
+                    vals.push((if maximize { raw } else { -raw }) - shift);
+                }
+            }
+            offsets.push(indices.len());
+        }
+        BenefitStorage::Sparse(CsrMatrix {
+            offsets,
+            indices,
+            vals,
+        })
+    };
 
     let spread = b_max - b_min;
     let is_constant = spread == 0.0;
@@ -421,11 +524,10 @@ fn build_complete_benefits(
     };
 
     NormalizedBenefits {
-        benefits,
+        storage,
         m,
         n,
         transposed,
-        has_forbidden,
         b_shift,
         scale,
         half_spread,
@@ -433,7 +535,7 @@ fn build_complete_benefits(
     }
 }
 
-/// Converts input costs into an `m <= n` row-major net-benefit matrix for `cost_limit` partial mode.
+/// Converts input costs into an `m <= n` CSR net-benefit matrix for `cost_limit` partial mode.
 /// Returns `Ok(None)` when no eligible (`net > 0.0`) entry exists.
 fn build_partial_benefits(
     costs: &[f64],
@@ -449,13 +551,19 @@ fn build_partial_benefits(
         (n_rows, n_cols)
     };
 
-    let mut benefits = vec![f64::NEG_INFINITY; m * n];
+    let mut offsets = Vec::with_capacity(m + 1);
+    let mut indices = Vec::new();
+    let mut vals = Vec::new();
     let mut b_max = 0.0_f64;
-    let mut has_positive = false;
+    offsets.push(0);
 
-    for r in 0..n_rows {
-        for c in 0..n_cols {
-            let val = costs[r * n_cols + c];
+    for i in 0..m {
+        for j in 0..n {
+            let val = if transposed {
+                costs[j * n_cols + i]
+            } else {
+                costs[i * n_cols + j]
+            };
             if !val.is_finite() {
                 continue;
             }
@@ -471,23 +579,26 @@ fn build_partial_benefits(
                     final_eps: 0.0,
                 });
             }
-            let (i, j) = if transposed { (c, r) } else { (r, c) };
-            benefits[i * n + j] = net;
+            indices.push(j);
+            vals.push(net);
             b_max = b_max.max(net);
-            has_positive = true;
         }
+        offsets.push(indices.len());
     }
 
-    if !has_positive {
+    if indices.is_empty() {
         return Ok(None);
     }
 
     Ok(Some(NormalizedBenefits {
-        benefits,
+        storage: BenefitStorage::Sparse(CsrMatrix {
+            offsets,
+            indices,
+            vals,
+        }),
         m,
         n,
         transposed,
-        has_forbidden: false,
         b_shift: 0.0,
         scale: b_max,
         half_spread: b_max * 0.5,
@@ -495,30 +606,169 @@ fn build_partial_benefits(
     }))
 }
 
-/// Finds `(best_idx, best_val, second_best_val, feasible_count)` over `(benefit, dual)` pairs.
+/// Returns the maximum `row[k] - p[k]` over a slice using 4 independent accumulators (`vmaxpd`-friendly).
 #[inline]
-fn best_two(items: impl Iterator<Item = (f64, f64)>) -> (usize, f64, f64, usize) {
-    let mut best_idx = NONE;
-    let mut best_val = f64::NEG_INFINITY;
-    let mut second_val = f64::NEG_INFINITY;
-    let mut feasible_count = 0usize;
+fn max_diff_slice(row: &[f64], p: &[f64]) -> f64 {
+    debug_assert_eq!(row.len(), p.len());
+    let len = row.len();
+    let mut m0 = f64::NEG_INFINITY;
+    let mut m1 = f64::NEG_INFINITY;
+    let mut m2 = f64::NEG_INFINITY;
+    let mut m3 = f64::NEG_INFINITY;
 
-    for (idx, (b, dual)) in items.enumerate() {
-        if !b.is_finite() {
-            continue;
+    let mut k = 0usize;
+    while k + 4 <= len {
+        unsafe {
+            let d0 = *row.get_unchecked(k) - *p.get_unchecked(k);
+            let d1 = *row.get_unchecked(k + 1) - *p.get_unchecked(k + 1);
+            let d2 = *row.get_unchecked(k + 2) - *p.get_unchecked(k + 2);
+            let d3 = *row.get_unchecked(k + 3) - *p.get_unchecked(k + 3);
+            if d0 > m0 {
+                m0 = d0;
+            }
+            if d1 > m1 {
+                m1 = d1;
+            }
+            if d2 > m2 {
+                m2 = d2;
+            }
+            if d3 > m3 {
+                m3 = d3;
+            }
         }
-        feasible_count += 1;
-        let val = b - dual;
-        if best_idx == NONE || val > best_val {
+        k += 4;
+    }
+    let mut best = m0.max(m1).max(m2.max(m3));
+    while k < len {
+        let d = unsafe { *row.get_unchecked(k) - *p.get_unchecked(k) };
+        if d > best {
+            best = d;
+        }
+        k += 1;
+    }
+    best
+}
+
+/// Finds `(best_idx, best_val, second_best_val)` over a dense finite slice of `(b, p)` pairs (`len >= 2`).
+#[inline]
+fn best_two_dense(row: &[f64], p: &[f64]) -> (usize, f64, f64) {
+    debug_assert_eq!(row.len(), p.len());
+    debug_assert!(row.len() >= 2);
+    let len = row.len();
+
+    if len < 16 {
+        let v0 = row[0] - p[0];
+        let v1 = row[1] - p[1];
+        let (mut best_idx, mut best_val, mut second_val) = if v1 > v0 {
+            (1usize, v1, v0)
+        } else {
+            (0usize, v0, v1)
+        };
+        for idx in 2..len {
+            let val = unsafe { *row.get_unchecked(idx) - *p.get_unchecked(idx) };
+            if val > best_val {
+                second_val = best_val;
+                best_val = val;
+                best_idx = idx;
+            } else if val > second_val {
+                second_val = val;
+            }
+        }
+        return (best_idx, best_val, second_val);
+    }
+
+    // Pass 1: 4-way unrolled argmax breaks loop-carried dependency for instruction-level parallelism.
+    let mut m0 = f64::NEG_INFINITY;
+    let mut m1 = f64::NEG_INFINITY;
+    let mut m2 = f64::NEG_INFINITY;
+    let mut m3 = f64::NEG_INFINITY;
+    let mut i0 = 0usize;
+    let mut i1 = 1usize;
+    let mut i2 = 2usize;
+    let mut i3 = 3usize;
+
+    let mut k = 0usize;
+    while k + 4 <= len {
+        unsafe {
+            let d0 = *row.get_unchecked(k) - *p.get_unchecked(k);
+            let d1 = *row.get_unchecked(k + 1) - *p.get_unchecked(k + 1);
+            let d2 = *row.get_unchecked(k + 2) - *p.get_unchecked(k + 2);
+            let d3 = *row.get_unchecked(k + 3) - *p.get_unchecked(k + 3);
+            if d0 > m0 {
+                m0 = d0;
+                i0 = k;
+            }
+            if d1 > m1 {
+                m1 = d1;
+                i1 = k + 1;
+            }
+            if d2 > m2 {
+                m2 = d2;
+                i2 = k + 2;
+            }
+            if d3 > m3 {
+                m3 = d3;
+                i3 = k + 3;
+            }
+        }
+        k += 4;
+    }
+
+    let (mut best_idx, mut best_val) = if m1 > m0 { (i1, m1) } else { (i0, m0) };
+    if m2 > best_val {
+        best_val = m2;
+        best_idx = i2;
+    }
+    if m3 > best_val {
+        best_val = m3;
+        best_idx = i3;
+    }
+    while k < len {
+        let d = unsafe { *row.get_unchecked(k) - *p.get_unchecked(k) };
+        if d > best_val {
+            best_val = d;
+            best_idx = k;
+        }
+        k += 1;
+    }
+
+    // Pass 2: branchless 4-lane max excluding best_idx.
+    let left_max = max_diff_slice(&row[..best_idx], &p[..best_idx]);
+    let right_max = max_diff_slice(&row[best_idx + 1..], &p[best_idx + 1..]);
+    (best_idx, best_val, left_max.max(right_max))
+}
+
+/// Finds `(best_idx, best_val, second_best_val, feasible_count)` over a sparse CSR adjacency slice.
+#[inline]
+fn best_two_csr(indices: &[usize], vals: &[f64], duals: &[f64]) -> (usize, f64, f64, usize) {
+    let len = indices.len();
+    if len == 0 {
+        return (NONE, f64::NEG_INFINITY, f64::NEG_INFINITY, 0);
+    }
+    let idx0 = unsafe { *indices.get_unchecked(0) };
+    let v0 = unsafe { *vals.get_unchecked(0) - *duals.get_unchecked(idx0) };
+    if len == 1 {
+        return (idx0, v0, f64::NEG_INFINITY, 1);
+    }
+    let idx1 = unsafe { *indices.get_unchecked(1) };
+    let v1 = unsafe { *vals.get_unchecked(1) - *duals.get_unchecked(idx1) };
+    let (mut best_idx, mut best_val, mut second_val) = if v1 > v0 {
+        (idx1, v1, v0)
+    } else {
+        (idx0, v0, v1)
+    };
+    for k in 2..len {
+        let idx = unsafe { *indices.get_unchecked(k) };
+        let val = unsafe { *vals.get_unchecked(k) - *duals.get_unchecked(idx) };
+        if val > best_val {
             second_val = best_val;
             best_val = val;
             best_idx = idx;
-        } else if feasible_count == 2 || val > second_val {
+        } else if val > second_val {
             second_val = val;
         }
     }
-
-    (best_idx, best_val, second_val, feasible_count)
+    (best_idx, best_val, second_val, len)
 }
 
 /// Checks and increments the global bid iteration counter, returning `Convergence` if exhausted.
@@ -535,6 +785,53 @@ fn step_iteration(state: &mut AuctionState<'_>, eps: f64) -> Result<(), SolverEr
     Ok(())
 }
 
+/// Ensures `state.pi[i]` satisfies `eps`-CS for unmatched rows before entering reverse bidding.
+fn sync_unmatched_row_duals(state: &mut AuctionState<'_>) {
+    match state.storage {
+        BenefitStorage::Dense(benefits) => {
+            for i in 0..state.m {
+                if state.row_to_col[i] != NONE {
+                    continue;
+                }
+                let row_off = i * state.n;
+                let mut best_val = f64::NEG_INFINITY;
+                for (&b, &pj) in benefits[row_off..row_off + state.n]
+                    .iter()
+                    .zip(state.p.iter())
+                {
+                    best_val = best_val.max(b - pj);
+                }
+                state.pi[i] = best_val;
+            }
+        }
+        BenefitStorage::Sparse(csr) => {
+            for i in 0..state.m {
+                if state.row_to_col[i] != NONE {
+                    continue;
+                }
+                let start = csr.offsets[i];
+                let end = csr.offsets[i + 1];
+                let mut best_val = f64::NEG_INFINITY;
+                for k in start..end {
+                    let j = csr.indices[k];
+                    best_val = best_val.max(csr.vals[k] - state.p[j]);
+                }
+                state.pi[i] = best_val;
+            }
+        }
+    }
+}
+
+/// Lazily builds `sparse_cols` from sparse row storage when reverse bidding runs.
+fn ensure_sparse_cols(state: &mut AuctionState<'_>) {
+    if state.sparse_cols.is_some() {
+        return;
+    }
+    if let BenefitStorage::Sparse(csr) = state.storage {
+        state.sparse_cols = Some(csr.transpose(state.m, state.n));
+    }
+}
+
 /// Executes one forward bid for unassigned row `row`. Returns `true` if `matched_count` increased.
 fn forward_bid(
     state: &mut AuctionState<'_>,
@@ -544,16 +841,40 @@ fn forward_bid(
 ) -> Result<bool, SolverError> {
     step_iteration(state, eps)?;
 
-    let row_off = row * state.n;
-    let (j1, v1, v2, feasible_count) = best_two(
-        state.benefits[row_off..row_off + state.n]
-            .iter()
-            .copied()
-            .zip(state.p.iter().copied()),
-    );
+    let (j1, v1, v2, feasible_count, b_best) = match state.storage {
+        BenefitStorage::Dense(benefits) => {
+            let row_off = row * state.n;
+            let row_slice = &benefits[row_off..row_off + state.n];
+            if state.n >= 2 {
+                let (idx, b1, b2) = best_two_dense(row_slice, &state.p);
+                (idx, b1, b2, state.n, row_slice[idx])
+            } else {
+                (
+                    0,
+                    row_slice[0] - state.p[0],
+                    f64::NEG_INFINITY,
+                    1,
+                    row_slice[0],
+                )
+            }
+        }
+        BenefitStorage::Sparse(csr) => {
+            let start = csr.offsets[row];
+            let end = csr.offsets[row + 1];
+            let cols = &csr.indices[start..end];
+            let vals = &csr.vals[start..end];
+            let (idx, b1, b2, count) = best_two_csr(cols, vals, &state.p);
+            let b_val = if idx == NONE {
+                f64::NEG_INFINITY
+            } else {
+                b1 + state.p[idx]
+            };
+            (idx, b1, b2, count, b_val)
+        }
+    };
+
     if partial {
         if j1 == NONE || v1 <= 0.0 {
-            // Unassigned outside option yields 0.0 net benefit; p[j] never decreases during forward pass.
             state.pi[row] = 0.0;
             return Ok(false);
         }
@@ -565,15 +886,14 @@ fn forward_bid(
 
     let p_old = state.p[j1];
     let (p_new, pi_new) = if partial {
-        // Private dummy option at benefit 0.0 keeps second-best finite and >= 0.0.
         let pi_new = v2.max(0.0) - eps;
-        (state.benefits[row_off + j1] - pi_new, pi_new)
+        (b_best - pi_new, pi_new)
     } else if feasible_count == 1 {
         let p_new = p_old + eps;
-        (p_new, state.benefits[row_off + j1] - p_new)
+        (p_new, b_best - p_new)
     } else {
         let pi_new = v2 - eps;
-        (state.benefits[row_off + j1] - pi_new, pi_new)
+        (b_best - pi_new, pi_new)
     };
 
     if p_new <= p_old || !p_new.is_finite() || !pi_new.is_finite() {
@@ -601,6 +921,49 @@ fn forward_bid(
     }
 }
 
+/// Best `(i1, u1, u2, feasible_count, b_best)` for column `col` during reverse bidding.
+#[inline]
+fn best_two_for_col(state: &AuctionState<'_>, col: usize) -> (usize, f64, f64, usize, f64) {
+    match (&state.storage, &state.sparse_cols) {
+        (BenefitStorage::Dense(benefits), _) => {
+            let mut best_idx = NONE;
+            let mut best_val = f64::NEG_INFINITY;
+            let mut second_val = f64::NEG_INFINITY;
+            for i in 0..state.m {
+                let b = benefits[i * state.n + col];
+                let val = b - state.pi[i];
+                if best_idx == NONE || val > best_val {
+                    second_val = best_val;
+                    best_val = val;
+                    best_idx = i;
+                } else if i == 1 || val > second_val {
+                    second_val = val;
+                }
+            }
+            let b_val = if best_idx == NONE {
+                f64::NEG_INFINITY
+            } else {
+                benefits[best_idx * state.n + col]
+            };
+            (best_idx, best_val, second_val, state.m, b_val)
+        }
+        (_, Some(csr_cols)) => {
+            let start = csr_cols.offsets[col];
+            let end = csr_cols.offsets[col + 1];
+            let rows = &csr_cols.indices[start..end];
+            let vals = &csr_cols.vals[start..end];
+            let (idx, u1, u2, count) = best_two_csr(rows, vals, &state.pi);
+            let b_val = if idx == NONE {
+                f64::NEG_INFINITY
+            } else {
+                u1 + state.pi[idx]
+            };
+            (idx, u1, u2, count, b_val)
+        }
+        (BenefitStorage::Sparse(_), None) => unreachable!("sparse_cols must be initialized"),
+    }
+}
+
 /// Executes one symmetric reverse bid for unassigned column `col` (`m == n`). Returns `true` if `matched_count` increased.
 fn reverse_bid_symmetric(
     state: &mut AuctionState<'_>,
@@ -609,13 +972,7 @@ fn reverse_bid_symmetric(
 ) -> Result<bool, SolverError> {
     step_iteration(state, eps)?;
 
-    let (i1, _u1, u2, feasible_count) = best_two(
-        state
-            .pi
-            .iter()
-            .enumerate()
-            .map(|(i, &pi_i)| (state.benefits[i * state.n + col], pi_i)),
-    );
+    let (i1, _u1, u2, feasible_count, b_val) = best_two_for_col(state, col);
     if i1 == NONE {
         return Err(SolverError::Infeasible(format!(
             "column {col} has no feasible rows"
@@ -623,7 +980,6 @@ fn reverse_bid_symmetric(
     }
 
     let pi_old = state.pi[i1];
-    let b_val = state.benefits[i1 * state.n + col];
     let (pi_new, p_new) = if feasible_count == 1 {
         let pi_new = pi_old + eps;
         (pi_new, b_val - pi_new)
@@ -657,9 +1013,14 @@ fn reverse_bid_symmetric(
     }
 }
 
-/// Runs one scaling round for square matrices (`m == n`), switching forward/reverse whenever cardinality increases.
+/// Runs one scaling round for square matrices (`m == n`), preferring fast forward passes and
+/// switching to reverse only when forward stalls without increasing cardinality.
 fn run_square_round(state: &mut AuctionState<'_>, eps: f64) -> Result<(), SolverError> {
     let mut forward = true;
+    let mut pi_synced = false;
+    let stall_limit = (state.m * 4).max(64);
+    let mut bids_since_progress = 0usize;
+
     while state.matched_count < state.m {
         if forward {
             let mut did_bid = false;
@@ -669,7 +1030,18 @@ fn run_square_round(state: &mut AuctionState<'_>, eps: f64) -> Result<(), Solver
                 }
                 did_bid = true;
                 if forward_bid(state, row, eps, false)? {
-                    forward = false;
+                    bids_since_progress = 0;
+                } else {
+                    bids_since_progress += 1;
+                    if bids_since_progress >= stall_limit {
+                        if !pi_synced {
+                            sync_unmatched_row_duals(state);
+                            ensure_sparse_cols(state);
+                            pi_synced = true;
+                        }
+                        forward = false;
+                        bids_since_progress = 0;
+                    }
                 }
                 break;
             }
@@ -686,7 +1058,14 @@ fn run_square_round(state: &mut AuctionState<'_>, eps: f64) -> Result<(), Solver
                 }
                 did_bid = true;
                 if reverse_bid_symmetric(state, col, eps)? {
+                    bids_since_progress = 0;
                     forward = true;
+                } else {
+                    bids_since_progress += 1;
+                    if bids_since_progress >= stall_limit {
+                        forward = true;
+                        bids_since_progress = 0;
+                    }
                 }
                 break;
             }
@@ -718,6 +1097,7 @@ fn run_reverse_cleanup(
     eps: f64,
     partial: bool,
 ) -> Result<(), SolverError> {
+    ensure_sparse_cols(state);
     let mut floor = if partial {
         0.0
     } else {
@@ -736,13 +1116,7 @@ fn run_reverse_cleanup(
         }
         step_iteration(state, eps)?;
 
-        let (i1, u1, u2, _feasible_count) = best_two(
-            state
-                .pi
-                .iter()
-                .enumerate()
-                .map(|(i, &pi_i)| (state.benefits[i * state.n + col], pi_i)),
-        );
+        let (i1, u1, u2, _feasible_count, b_val) = best_two_for_col(state, col);
         let should_drop = if partial {
             i1 == NONE || u1 <= 0.0
         } else {
@@ -753,10 +1127,9 @@ fn run_reverse_cleanup(
             continue;
         }
 
-        // For single-feasible-row columns (u2 == -inf), (u2 - eps).max(floor) evaluates cleanly to floor.
         let p_new = (u2 - eps).max(floor);
         let pi_old = state.pi[i1];
-        let pi_new = state.benefits[i1 * state.n + col] - p_new;
+        let pi_new = b_val - p_new;
         if pi_new <= pi_old || !pi_new.is_finite() || !p_new.is_finite() {
             return Err(SolverError::Convergence {
                 message: "f64 ULP stagnation in asymmetric reverse bid".to_string(),
@@ -803,7 +1176,6 @@ fn run_rectangular_round(state: &mut AuctionState<'_>, eps: f64) -> Result<(), S
 
     // Re-verify after cleanup that no unassigned column remains above min_{k assigned} p[k].
     loop {
-        run_reverse_cleanup(state, eps, false)?;
         let lambda = min_assigned_price(&state.row_to_col, &state.p);
         let has_unassigned_above = state
             .col_to_row
@@ -813,6 +1185,7 @@ fn run_rectangular_round(state: &mut AuctionState<'_>, eps: f64) -> Result<(), S
         if !has_unassigned_above {
             break;
         }
+        run_reverse_cleanup(state, eps, false)?;
     }
     Ok(())
 }
@@ -825,10 +1198,18 @@ fn run_partial_round(state: &mut AuctionState<'_>, eps: f64) -> Result<(), Solve
         }
         forward_bid(state, row, eps, true)?;
     }
-    run_reverse_cleanup(state, eps, true)
+    let has_unassigned_pos = state
+        .col_to_row
+        .iter()
+        .enumerate()
+        .any(|(j, &row)| row == NONE && state.p[j] > 0.0);
+    if has_unassigned_pos {
+        run_reverse_cleanup(state, eps, true)?;
+    }
+    Ok(())
 }
 
-/// Initializes a scaling round by clearing assignments, anchoring `min(p) = 0` in complete mode, and resetting `pi[i]`.
+/// Initializes a scaling round by clearing assignments and anchoring `min(p) = 0` in complete mode.
 fn init_scaling_round(state: &mut AuctionState<'_>, is_first_round: bool, partial: bool) {
     if !partial && !is_first_round {
         let (p_min, p_max) = state
@@ -853,20 +1234,6 @@ fn init_scaling_round(state: &mut AuctionState<'_>, is_first_round: bool, partia
     if !partial && state.m == state.n {
         state.unassigned_cols.clear();
         state.unassigned_cols.extend(0..state.n);
-    }
-
-    for (i, pi_slot) in state.pi.iter_mut().enumerate() {
-        let row_off = i * state.n;
-        let mut best_val = if partial { 0.0 } else { f64::NEG_INFINITY };
-        for (&b, &pj) in state.benefits[row_off..row_off + state.n]
-            .iter()
-            .zip(state.p.iter())
-        {
-            if b.is_finite() {
-                best_val = best_val.max(b - pj);
-            }
-        }
-        *pi_slot = best_val;
     }
 }
 
@@ -901,6 +1268,27 @@ pub fn solve_dense(
     n_cols: usize,
     config: &SolveConfig,
 ) -> Result<SolveOutput, SolverError> {
+    solve_dense_with_mode(costs, n_rows, n_cols, config, true)
+}
+
+/// Fast path returning only `(row_ind, col_ind)` without computing final `cost` or returning dual price vectors.
+pub fn assign_dense(
+    costs: &[f64],
+    n_rows: usize,
+    n_cols: usize,
+    config: &SolveConfig,
+) -> Result<(Vec<usize>, Vec<usize>), SolverError> {
+    let out = solve_dense_with_mode(costs, n_rows, n_cols, config, false)?;
+    Ok((out.row_ind, out.col_ind))
+}
+
+fn solve_dense_with_mode(
+    costs: &[f64],
+    n_rows: usize,
+    n_cols: usize,
+    config: &SolveConfig,
+    include_diagnostics: bool,
+) -> Result<SolveOutput, SolverError> {
     validate_inputs(costs, n_rows, n_cols, config)?;
 
     let mode = classify_mode(config.cost_limit, config.maximize);
@@ -922,12 +1310,13 @@ pub fn solve_dense(
         AssignmentMode::Empty => unreachable!(),
     };
 
-    if !partial && norm.has_forbidden {
-        let feasible: Vec<bool> = norm.benefits.iter().map(|b| b.is_finite()).collect();
-        if !has_complete_bipartite_matching(&feasible, norm.m, norm.n) {
-            return Err(SolverError::Infeasible(
-                "gated cost matrix has no valid complete assignment".to_string(),
-            ));
+    if !partial {
+        if let BenefitStorage::Sparse(csr) = &norm.storage {
+            if !has_complete_bipartite_matching_csr(csr, norm.m, norm.n) {
+                return Err(SolverError::Infeasible(
+                    "gated cost matrix has no valid complete assignment".to_string(),
+                ));
+            }
         }
     }
 
@@ -945,7 +1334,8 @@ pub fn solve_dense(
     });
 
     let mut state = AuctionState {
-        benefits: &norm.benefits,
+        storage: &norm.storage,
+        sparse_cols: None,
         m: norm.m,
         n: norm.n,
         pi: vec![0.0; norm.m],
@@ -982,7 +1372,7 @@ pub fn solve_dense(
         eps = if next_eps >= eps { eps_min } else { next_eps };
     }
 
-    if norm.b_shift != 0.0 && norm.b_shift.is_finite() {
+    if include_diagnostics && norm.b_shift != 0.0 && norm.b_shift.is_finite() {
         for r_price in &mut state.pi {
             *r_price += norm.b_shift;
         }
@@ -997,7 +1387,11 @@ pub fn solve_dense(
             .collect();
         pairs.sort_unstable_by_key(|&(r, _)| r);
         let (rows, cols): (Vec<usize>, Vec<usize>) = pairs.into_iter().unzip();
-        (rows, cols, state.p, state.pi)
+        if include_diagnostics {
+            (rows, cols, state.p, state.pi)
+        } else {
+            (rows, cols, Vec::new(), Vec::new())
+        }
     } else {
         let mut rows = Vec::with_capacity(state.matched_count);
         let mut cols = Vec::with_capacity(state.matched_count);
@@ -1007,14 +1401,22 @@ pub fn solve_dense(
                 cols.push(c);
             }
         }
-        (rows, cols, state.pi, state.p)
+        if include_diagnostics {
+            (rows, cols, state.pi, state.p)
+        } else {
+            (rows, cols, Vec::new(), Vec::new())
+        }
     };
 
-    let cost: f64 = row_ind
-        .iter()
-        .zip(&col_ind)
-        .map(|(&r, &c)| costs[r * n_cols + c])
-        .sum();
+    let cost: f64 = if include_diagnostics {
+        row_ind
+            .iter()
+            .zip(&col_ind)
+            .map(|(&r, &c)| costs[r * n_cols + c])
+            .sum()
+    } else {
+        0.0
+    };
 
     Ok(SolveOutput {
         row_ind,
