@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "auction-assign"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast Bertsekas auction algorithm for linear sum assignment in Rust with Python bindings"
 readme = "README.md"
 requires-python = ">=3.10"
