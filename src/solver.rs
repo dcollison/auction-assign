@@ -800,7 +800,21 @@ fn run_rectangular_round(state: &mut AuctionState<'_>, eps: f64) -> Result<(), S
         }
         forward_bid(state, row, eps, false)?;
     }
-    run_reverse_cleanup(state, eps, false)
+
+    // Re-verify after cleanup that no unassigned column remains above min_{k assigned} p[k].
+    loop {
+        run_reverse_cleanup(state, eps, false)?;
+        let lambda = min_assigned_price(&state.row_to_col, &state.p);
+        let has_unassigned_above = state
+            .col_to_row
+            .iter()
+            .enumerate()
+            .any(|(j, &row)| row == NONE && state.p[j] > lambda);
+        if !has_unassigned_above {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Runs one scaling round for partial assignment (`cost_limit` finite): forward pass with unassigned option at `0.0`, then reverse cleanup down to `0.0`.
@@ -1051,6 +1065,27 @@ mod tests {
         }
     }
 
+    fn assert_unassigned_price_floor(assigned_indices: &[usize], prices: &[f64], label: &str) {
+        let mut assigned = vec![false; prices.len()];
+        let mut min_assigned = f64::INFINITY;
+        for &idx in assigned_indices {
+            assigned[idx] = true;
+            min_assigned = min_assigned.min(prices[idx]);
+        }
+        let max_unassigned = prices
+            .iter()
+            .enumerate()
+            .filter(|&(idx, _)| !assigned[idx])
+            .map(|(_, &p)| p)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let p_scale = prices.iter().map(|v| v.abs()).fold(1.0_f64, f64::max);
+        let tol = 1e-12 * p_scale;
+        assert!(
+            max_unassigned <= min_assigned + tol,
+            "asymmetric {label} price invariant violated: max_unassigned={max_unassigned} > min_assigned={min_assigned}"
+        );
+    }
+
     fn assert_eps_cs(
         costs: &[f64],
         n_rows: usize,
@@ -1058,12 +1093,13 @@ mod tests {
         maximize: bool,
         out: &SolveOutput,
     ) {
-        let tol = 1e-8
-            * (out
-                .row_prices
-                .iter()
-                .map(|v| v.abs())
-                .fold(1.0_f64, f64::max));
+        let scale = out
+            .row_prices
+            .iter()
+            .chain(out.col_prices.iter())
+            .map(|v| v.abs())
+            .fold(1.0_f64, f64::max);
+        let tol = 1e-8 * scale;
         for r in 0..n_rows {
             for c in 0..n_cols {
                 let raw = costs[r * n_cols + c];
@@ -1079,6 +1115,22 @@ mod tests {
                     );
                 }
             }
+        }
+        for (&r, &c) in out.row_ind.iter().zip(&out.col_ind) {
+            let raw = costs[r * n_cols + c];
+            let b = if maximize { raw } else { -raw };
+            assert!(b.is_finite(), "matched pair ({r}, {c}) has non-finite cost");
+            assert!(
+                (out.row_prices[r] + out.col_prices[c] - b).abs() <= tol,
+                "matched CS violated at ({r}, {c}): {} + {} != {b}",
+                out.row_prices[r],
+                out.col_prices[c],
+            );
+        }
+        if n_rows < n_cols {
+            assert_unassigned_price_floor(&out.col_ind, &out.col_prices, "col");
+        } else if n_rows > n_cols {
+            assert_unassigned_price_floor(&out.row_ind, &out.row_prices, "row");
         }
     }
 
@@ -1350,6 +1402,211 @@ mod tests {
         let out_ninf_limit = solve_dense(&neg_costs, 3, 3, &ninf_max_limit_cfg)
             .expect("-inf max limit should solve");
         assert_eq!(out_ninf_limit.col_ind, out_max.col_ind);
+    }
+
+    fn brute_force_complete_optimal_cost(
+        costs: &[f64],
+        n_rows: usize,
+        n_cols: usize,
+        maximize: bool,
+    ) -> Option<f64> {
+        struct CompleteSearch<'a> {
+            costs: &'a [f64],
+            m: usize,
+            n: usize,
+            n_cols: usize,
+            transposed: bool,
+            maximize: bool,
+            used: Vec<bool>,
+            best: Option<f64>,
+        }
+
+        impl CompleteSearch<'_> {
+            fn dfs(&mut self, i: usize, acc: f64) {
+                if i == self.m {
+                    self.best = Some(match self.best {
+                        None => acc,
+                        Some(cur) => {
+                            if self.maximize {
+                                cur.max(acc)
+                            } else {
+                                cur.min(acc)
+                            }
+                        }
+                    });
+                    return;
+                }
+                for j in 0..self.n {
+                    if self.used[j] {
+                        continue;
+                    }
+                    let (r, c) = if self.transposed { (j, i) } else { (i, j) };
+                    let val = self.costs[r * self.n_cols + c];
+                    if !val.is_finite() {
+                        continue;
+                    }
+                    self.used[j] = true;
+                    self.dfs(i + 1, acc + val);
+                    self.used[j] = false;
+                }
+            }
+        }
+
+        let transposed = n_rows > n_cols;
+        let (m, n) = if transposed {
+            (n_cols, n_rows)
+        } else {
+            (n_rows, n_cols)
+        };
+        let mut search = CompleteSearch {
+            costs,
+            m,
+            n,
+            n_cols,
+            transposed,
+            maximize,
+            used: vec![false; n],
+            best: None,
+        };
+        search.dfs(0, 0.0);
+        search.best
+    }
+
+    #[test]
+    fn test_rectangular_reverse_cleanup_lambda_invariant() {
+        let min_cfg = default_config();
+        let max_cfg = SolveConfig {
+            maximize: true,
+            ..default_config()
+        };
+        let inf = f64::INFINITY;
+        let ninf = f64::NEG_INFINITY;
+
+        // Multi-round 2x3 and 3x5/3x6 matrices exercising reverse cleanup steals, clamping at floor, and drops.
+        let wide_cases: &[(&[f64], usize, usize, bool, f64)] = &[
+            (&[100.0, 90.0, 0.0, 0.0, 90.0, 89.0], 2, 3, true, 190.0),
+            (
+                &[
+                    1.0, 2.0, 100.0, 100.0, 100.0, //
+                    1.0, 100.0, 2.0, 100.0, 100.0, //
+                    100.0, 100.0, 3.0, 4.0, 5.0,
+                ],
+                3,
+                5,
+                false,
+                6.0,
+            ),
+            (
+                &[
+                    50.0, 49.0, 10.0, 0.0, inf, //
+                    49.0, 48.0, inf, 12.0, 11.0, //
+                    1.0, 2.0, 30.0, 29.0, 28.0,
+                ],
+                3,
+                5,
+                false,
+                12.0,
+            ),
+            (
+                &[
+                    80.0, 79.0, ninf, 10.0, 5.0, 1.0, //
+                    79.0, 77.0, 60.0, ninf, 20.0, 2.0, //
+                    10.0, 12.0, 59.0, 58.0, 40.0, ninf,
+                ],
+                3,
+                6,
+                true,
+                217.0,
+            ),
+        ];
+
+        for &(costs, n_rows, n_cols, maximize, expected_opt) in wide_cases {
+            let cfg = if maximize { &max_cfg } else { &min_cfg };
+            let out = solve_dense(costs, n_rows, n_cols, cfg)
+                .expect("rectangular complete case should solve");
+            assert!(out.scaling_rounds > 1);
+            assert_valid_matching(&out.row_ind, &out.col_ind, n_rows, n_cols);
+            assert_eps_cs(costs, n_rows, n_cols, maximize, &out);
+            assert_unassigned_price_floor(&out.col_ind, &out.col_prices, "col");
+            let oracle = brute_force_complete_optimal_cost(costs, n_rows, n_cols, maximize)
+                .expect("crafted rectangular case must be feasible");
+            assert!((oracle - expected_opt).abs() < 1e-12);
+            assert!(
+                (out.cost - expected_opt).abs() <= (n_rows as f64) * out.final_eps + 1e-9,
+                "wide optimality gap: got={}, expected={expected_opt}",
+                out.cost
+            );
+
+            // Also verify transposed tall orientation (M > N).
+            let mut transposed = vec![0.0; n_rows * n_cols];
+            for r in 0..n_rows {
+                for c in 0..n_cols {
+                    transposed[c * n_rows + r] = costs[r * n_cols + c];
+                }
+            }
+            let out_t = solve_dense(&transposed, n_cols, n_rows, cfg)
+                .expect("transposed rectangular case should solve");
+            assert_valid_matching(&out_t.row_ind, &out_t.col_ind, n_cols, n_rows);
+            assert_eps_cs(&transposed, n_cols, n_rows, maximize, &out_t);
+            assert_unassigned_price_floor(&out_t.row_ind, &out_t.row_prices, "row");
+            assert!(
+                (out_t.cost - expected_opt).abs() <= (n_rows as f64) * out_t.final_eps + 1e-9,
+                "tall optimality gap: got={}, expected={expected_opt}",
+                out_t.cost
+            );
+        }
+
+        // Deterministic PRNG differential sweep over multi-round m < n and m > n matrices.
+        let mut seed: u64 = 0x517c_c1b7_2722_0a95;
+        let mut next_u64 = || -> u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for case_idx in 0..120 {
+            let m_small = ((next_u64() % 4) + 2) as usize;
+            let n_large = m_small + ((next_u64() % 3) + 1) as usize;
+            let (n_rows, n_cols) = if case_idx % 2 == 0 {
+                (m_small, n_large)
+            } else {
+                (n_large, m_small)
+            };
+            let maximize = (case_idx / 2) % 2 == 1;
+            let offset = if case_idx % 3 == 0 { 1000.0 } else { 0.0 };
+
+            let mut costs = Vec::with_capacity(n_rows * n_cols);
+            for _ in 0..(n_rows * n_cols) {
+                if next_u64() % 6 == 0 {
+                    costs.push(if maximize { ninf } else { inf });
+                } else {
+                    let v = ((next_u64() % 200) as f64) * 0.5 - 50.0 + offset;
+                    costs.push(v);
+                }
+            }
+
+            let oracle = brute_force_complete_optimal_cost(&costs, n_rows, n_cols, maximize);
+            let cfg = if maximize { &max_cfg } else { &min_cfg };
+            match (oracle, solve_dense(&costs, n_rows, n_cols, cfg)) {
+                (None, Err(SolverError::Infeasible(_))) => {}
+                (Some(best_cost), Ok(out)) => {
+                    assert_valid_matching(&out.row_ind, &out.col_ind, n_rows, n_cols);
+                    assert_eps_cs(&costs, n_rows, n_cols, maximize, &out);
+                    let tol = 1e-8 * best_cost.abs().max(1.0);
+                    assert!(
+                        (out.cost - best_cost).abs() <= (m_small as f64) * out.final_eps + tol,
+                        "case {case_idx} ({n_rows}x{n_cols}, max={maximize}): best={best_cost}, got={}",
+                        out.cost
+                    );
+                }
+                (oracle_res, solver_res) => {
+                    panic!(
+                        "case {case_idx} mismatch: oracle={oracle_res:?}, solver={solver_res:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
