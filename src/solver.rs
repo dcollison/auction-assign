@@ -88,6 +88,13 @@ pub struct SolveOutput {
     pub col_prices: Vec<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AssignmentMode {
+    Complete,
+    Partial(f64),
+    Empty,
+}
+
 struct NormalizedBenefits {
     benefits: Vec<f64>,
     m: usize,
@@ -428,6 +435,68 @@ fn build_complete_benefits(
     }
 }
 
+/// Converts input costs into an `m <= n` row-major net-benefit matrix for `cost_limit` partial mode.
+/// Returns `Ok(None)` when no eligible (`net > 0.0`) entry exists.
+fn build_partial_benefits(
+    costs: &[f64],
+    n_rows: usize,
+    n_cols: usize,
+    maximize: bool,
+    limit: f64,
+) -> Result<Option<NormalizedBenefits>, SolverError> {
+    let transposed = n_rows > n_cols;
+    let (m, n) = if transposed {
+        (n_cols, n_rows)
+    } else {
+        (n_rows, n_cols)
+    };
+
+    let mut benefits = vec![f64::NEG_INFINITY; m * n];
+    let mut b_max = 0.0_f64;
+    let mut has_positive = false;
+
+    for r in 0..n_rows {
+        for c in 0..n_cols {
+            let val = costs[r * n_cols + c];
+            if !val.is_finite() {
+                continue;
+            }
+            let eligible = if maximize { val > limit } else { val < limit };
+            if !eligible {
+                continue;
+            }
+            let net = if maximize { val - limit } else { limit - val };
+            if !net.is_finite() {
+                return Err(SolverError::Convergence {
+                    message: "net benefit overflows f64 in partial mode".to_string(),
+                    iterations: 0,
+                    final_eps: 0.0,
+                });
+            }
+            let (i, j) = if transposed { (c, r) } else { (r, c) };
+            benefits[i * n + j] = net;
+            b_max = b_max.max(net);
+            has_positive = true;
+        }
+    }
+
+    if !has_positive {
+        return Ok(None);
+    }
+
+    Ok(Some(NormalizedBenefits {
+        benefits,
+        m,
+        n,
+        transposed,
+        has_forbidden: false,
+        b_shift: 0.0,
+        scale: b_max,
+        half_spread: b_max * 0.5,
+        is_constant: false,
+    }))
+}
+
 /// Finds `(best_idx, best_val, second_best_val, feasible_count)` over `(benefit, dual)` pairs.
 #[inline]
 fn best_two(items: impl Iterator<Item = (f64, f64)>) -> (usize, f64, f64, usize) {
@@ -469,24 +538,39 @@ fn step_iteration(state: &mut AuctionState<'_>, eps: f64) -> Result<(), SolverEr
 }
 
 /// Executes one forward bid for unassigned row `row`. Returns `true` if `matched_count` increased.
-fn forward_bid(state: &mut AuctionState<'_>, row: usize, eps: f64) -> Result<bool, SolverError> {
+fn forward_bid(
+    state: &mut AuctionState<'_>,
+    row: usize,
+    eps: f64,
+    partial: bool,
+) -> Result<bool, SolverError> {
     step_iteration(state, eps)?;
 
     let row_off = row * state.n;
-    let (j1, _v1, v2, feasible_count) = best_two(
+    let (j1, v1, v2, feasible_count) = best_two(
         state.benefits[row_off..row_off + state.n]
             .iter()
             .copied()
             .zip(state.p.iter().copied()),
     );
-    if j1 == NONE {
+    if partial {
+        if j1 == NONE || v1 <= 0.0 {
+            // Unassigned outside option yields 0.0 net benefit; p[j] never decreases during forward pass.
+            state.pi[row] = 0.0;
+            return Ok(false);
+        }
+    } else if j1 == NONE {
         return Err(SolverError::Infeasible(format!(
             "row {row} has no feasible columns"
         )));
     }
 
     let p_old = state.p[j1];
-    let (p_new, pi_new) = if feasible_count == 1 {
+    let (p_new, pi_new) = if partial {
+        // Private dummy option at benefit 0.0 keeps second-best finite and >= 0.0.
+        let pi_new = v2.max(0.0) - eps;
+        (state.benefits[row_off + j1] - pi_new, pi_new)
+    } else if feasible_count == 1 {
         let p_new = p_old + eps;
         (p_new, state.benefits[row_off + j1] - p_new)
     } else {
@@ -586,7 +670,7 @@ fn run_square_round(state: &mut AuctionState<'_>, eps: f64) -> Result<(), Solver
                     continue;
                 }
                 did_bid = true;
-                if forward_bid(state, row, eps)? {
+                if forward_bid(state, row, eps, false)? {
                     forward = false;
                 }
                 break;
@@ -630,31 +714,26 @@ fn min_assigned_price(row_to_col: &[usize], p: &[f64]) -> f64 {
     lambda
 }
 
-/// Runs one scaling round for wide rectangular matrices (`m < n`): forward assignment then asymmetric reverse cleanup.
-fn run_rectangular_round(state: &mut AuctionState<'_>, eps: f64) -> Result<(), SolverError> {
-    while state.matched_count < state.m {
-        let Some(row) = state.unassigned_rows.pop_front() else {
-            return Err(SolverError::Infeasible(
-                "no unassigned rows remaining before reaching complete matching".to_string(),
-            ));
-        };
-        if state.row_to_col[row] != NONE {
-            continue;
-        }
-        forward_bid(state, row, eps)?;
-    }
-
-    let mut lambda = min_assigned_price(&state.row_to_col, &state.p);
+/// Lowers unassigned columns above `floor` (`lambda` in complete `m < n`, `0.0` in partial mode).
+fn run_reverse_cleanup(
+    state: &mut AuctionState<'_>,
+    eps: f64,
+    partial: bool,
+) -> Result<(), SolverError> {
+    let mut floor = if partial {
+        0.0
+    } else {
+        min_assigned_price(&state.row_to_col, &state.p)
+    };
     let mut rev_queue = VecDeque::new();
     for j in 0..state.n {
-        if state.col_to_row[j] == NONE && state.p[j] > lambda {
+        if state.col_to_row[j] == NONE && state.p[j] > floor {
             rev_queue.push_back(j);
         }
     }
 
-    // Lower any unassigned column with p[j] > lambda to maintain Bertsekas-Castanon asymmetric optimality.
     while let Some(col) = rev_queue.pop_front() {
-        if state.col_to_row[col] != NONE || state.p[col] <= lambda {
+        if state.col_to_row[col] != NONE || state.p[col] <= floor {
             continue;
         }
         step_iteration(state, eps)?;
@@ -666,13 +745,18 @@ fn run_rectangular_round(state: &mut AuctionState<'_>, eps: f64) -> Result<(), S
                 .enumerate()
                 .map(|(i, &pi_i)| (state.benefits[i * state.n + col], pi_i)),
         );
-        if i1 == NONE || u1 - eps <= lambda {
-            state.p[col] = lambda;
+        let should_drop = if partial {
+            i1 == NONE || u1 <= 0.0
+        } else {
+            i1 == NONE || u1 - eps <= floor
+        };
+        if should_drop {
+            state.p[col] = floor;
             continue;
         }
 
-        // For single-feasible-row columns (u2 == -inf), (u2 - eps).max(lambda) evaluates cleanly to lambda.
-        let p_new = (u2 - eps).max(lambda);
+        // For single-feasible-row columns (u2 == -inf), (u2 - eps).max(floor) evaluates cleanly to floor.
+        let p_new = (u2 - eps).max(floor);
         let pi_old = state.pi[i1];
         let pi_new = state.benefits[i1 * state.n + col] - p_new;
         if pi_new <= pi_old || !pi_new.is_finite() || !p_new.is_finite() {
@@ -689,20 +773,52 @@ fn run_rectangular_round(state: &mut AuctionState<'_>, eps: f64) -> Result<(), S
         let prev_col = state.row_to_col[i1];
         state.row_to_col[i1] = col;
         state.col_to_row[col] = i1;
-        state.col_to_row[prev_col] = NONE;
-
-        lambda = min_assigned_price(&state.row_to_col, &state.p);
-        if state.p[prev_col] > lambda {
-            rev_queue.push_back(prev_col);
+        if prev_col == NONE {
+            state.matched_count += 1;
+        } else {
+            state.col_to_row[prev_col] = NONE;
+            if !partial {
+                floor = min_assigned_price(&state.row_to_col, &state.p);
+            }
+            if state.p[prev_col] > floor {
+                rev_queue.push_back(prev_col);
+            }
         }
     }
 
     Ok(())
 }
 
-/// Initializes a scaling round by anchoring `min(p) = 0`, clearing assignments, and setting `pi[i] = max_j (b[i,j] - p[j])`.
-fn init_scaling_round(state: &mut AuctionState<'_>, is_first_round: bool) {
-    if !is_first_round {
+/// Runs one scaling round for wide rectangular matrices (`m < n`): forward assignment then asymmetric reverse cleanup.
+fn run_rectangular_round(state: &mut AuctionState<'_>, eps: f64) -> Result<(), SolverError> {
+    while state.matched_count < state.m {
+        let Some(row) = state.unassigned_rows.pop_front() else {
+            return Err(SolverError::Infeasible(
+                "no unassigned rows remaining before reaching complete matching".to_string(),
+            ));
+        };
+        if state.row_to_col[row] != NONE {
+            continue;
+        }
+        forward_bid(state, row, eps, false)?;
+    }
+    run_reverse_cleanup(state, eps, false)
+}
+
+/// Runs one scaling round for partial assignment (`cost_limit` finite): forward pass with unassigned option at `0.0`, then reverse cleanup down to `0.0`.
+fn run_partial_round(state: &mut AuctionState<'_>, eps: f64) -> Result<(), SolverError> {
+    while let Some(row) = state.unassigned_rows.pop_front() {
+        if state.row_to_col[row] != NONE {
+            continue;
+        }
+        forward_bid(state, row, eps, true)?;
+    }
+    run_reverse_cleanup(state, eps, true)
+}
+
+/// Initializes a scaling round by clearing assignments, anchoring `min(p) = 0` in complete mode, and resetting `pi[i]`.
+fn init_scaling_round(state: &mut AuctionState<'_>, is_first_round: bool, partial: bool) {
+    if !partial && !is_first_round {
         let (p_min, p_max) = state
             .p
             .iter()
@@ -722,14 +838,14 @@ fn init_scaling_round(state: &mut AuctionState<'_>, is_first_round: bool) {
     state.matched_count = 0;
     state.unassigned_rows.clear();
     state.unassigned_rows.extend(0..state.m);
-    if state.m == state.n {
+    if !partial && state.m == state.n {
         state.unassigned_cols.clear();
         state.unassigned_cols.extend(0..state.n);
     }
 
     for (i, pi_slot) in state.pi.iter_mut().enumerate() {
         let row_off = i * state.n;
-        let mut best_val = f64::NEG_INFINITY;
+        let mut best_val = if partial { 0.0 } else { f64::NEG_INFINITY };
         for (&b, &pj) in state.benefits[row_off..row_off + state.n]
             .iter()
             .zip(state.p.iter())
@@ -742,6 +858,30 @@ fn init_scaling_round(state: &mut AuctionState<'_>, is_first_round: bool) {
     }
 }
 
+fn classify_mode(cost_limit: Option<f64>, maximize: bool) -> AssignmentMode {
+    match cost_limit {
+        None => AssignmentMode::Complete,
+        Some(limit) if !maximize && limit == f64::INFINITY => AssignmentMode::Complete,
+        Some(limit) if maximize && limit == f64::NEG_INFINITY => AssignmentMode::Complete,
+        Some(limit) if !maximize && limit == f64::NEG_INFINITY => AssignmentMode::Empty,
+        Some(limit) if maximize && limit == f64::INFINITY => AssignmentMode::Empty,
+        Some(limit) => AssignmentMode::Partial(limit),
+    }
+}
+
+fn empty_output(n_rows: usize, n_cols: usize) -> SolveOutput {
+    SolveOutput {
+        row_ind: Vec::new(),
+        col_ind: Vec::new(),
+        cost: 0.0,
+        iterations: 0,
+        scaling_rounds: 0,
+        final_eps: 0.0,
+        row_prices: vec![0.0; n_rows],
+        col_prices: vec![0.0; n_cols],
+    }
+}
+
 /// Solves a dense 2D linear assignment problem in row-major layout.
 pub fn solve_dense(
     costs: &[f64],
@@ -751,34 +891,26 @@ pub fn solve_dense(
 ) -> Result<SolveOutput, SolverError> {
     validate_inputs(costs, n_rows, n_cols, config)?;
 
-    let effective_unbounded = match config.cost_limit {
-        None => true,
-        Some(limit) if !config.maximize && limit == f64::INFINITY => true,
-        Some(limit) if config.maximize && limit == f64::NEG_INFINITY => true,
-        Some(_) => false,
+    let mode = classify_mode(config.cost_limit, config.maximize);
+    if n_rows == 0 || n_cols == 0 || mode == AssignmentMode::Empty {
+        return Ok(empty_output(n_rows, n_cols));
+    }
+
+    let (norm, partial) = match mode {
+        AssignmentMode::Complete => (
+            build_complete_benefits(costs, n_rows, n_cols, config.maximize),
+            false,
+        ),
+        AssignmentMode::Partial(limit) => {
+            match build_partial_benefits(costs, n_rows, n_cols, config.maximize, limit)? {
+                Some(norm) => (norm, true),
+                None => return Ok(empty_output(n_rows, n_cols)),
+            }
+        }
+        AssignmentMode::Empty => unreachable!(),
     };
-    if !effective_unbounded {
-        return Err(SolverError::InvalidInput(
-            "finite or empty cost_limit is not yet implemented".to_string(),
-        ));
-    }
 
-    if n_rows == 0 || n_cols == 0 {
-        return Ok(SolveOutput {
-            row_ind: Vec::new(),
-            col_ind: Vec::new(),
-            cost: 0.0,
-            iterations: 0,
-            scaling_rounds: 0,
-            final_eps: 0.0,
-            row_prices: vec![0.0; n_rows],
-            col_prices: vec![0.0; n_cols],
-        });
-    }
-
-    let norm = build_complete_benefits(costs, n_rows, n_cols, config.maximize);
-
-    if norm.has_forbidden {
+    if !partial && norm.has_forbidden {
         let feasible: Vec<bool> = norm.benefits.iter().map(|b| b.is_finite()).collect();
         if !has_complete_bipartite_matching(&feasible, norm.m, norm.n) {
             return Err(SolverError::Infeasible(
@@ -809,7 +941,7 @@ pub fn solve_dense(
         row_to_col: vec![NONE; norm.m],
         col_to_row: vec![NONE; norm.n],
         unassigned_rows: VecDeque::with_capacity(norm.m),
-        unassigned_cols: if norm.m == norm.n {
+        unassigned_cols: if !partial && norm.m == norm.n {
             VecDeque::with_capacity(norm.n)
         } else {
             VecDeque::new()
@@ -822,8 +954,10 @@ pub fn solve_dense(
     let mut scaling_rounds = 0usize;
     loop {
         scaling_rounds += 1;
-        init_scaling_round(&mut state, scaling_rounds == 1);
-        if state.m == state.n {
+        init_scaling_round(&mut state, scaling_rounds == 1, partial);
+        if partial {
+            run_partial_round(&mut state, eps)?;
+        } else if state.m == state.n {
             run_square_round(&mut state, eps)?;
         } else {
             run_rectangular_round(&mut state, eps)?;
@@ -843,14 +977,25 @@ pub fn solve_dense(
     }
 
     let (row_ind, col_ind, row_prices, col_prices) = if norm.transposed {
-        let mut pairs: Vec<(usize, usize)> =
-            (0..norm.m).map(|c| (state.row_to_col[c], c)).collect();
+        let mut pairs: Vec<(usize, usize)> = (0..norm.m)
+            .filter_map(|c| {
+                let r = state.row_to_col[c];
+                (r != NONE).then_some((r, c))
+            })
+            .collect();
         pairs.sort_unstable_by_key(|&(r, _)| r);
         let (rows, cols): (Vec<usize>, Vec<usize>) = pairs.into_iter().unzip();
         (rows, cols, state.p, state.pi)
     } else {
-        let rows: Vec<usize> = (0..norm.m).collect();
-        (rows, state.row_to_col, state.pi, state.p)
+        let mut rows = Vec::with_capacity(state.matched_count);
+        let mut cols = Vec::with_capacity(state.matched_count);
+        for (r, &c) in state.row_to_col.iter().enumerate() {
+            if c != NONE {
+                rows.push(r);
+                cols.push(c);
+            }
+        }
+        (rows, cols, state.pi, state.p)
     };
 
     let cost: f64 = row_ind
@@ -941,17 +1086,40 @@ mod tests {
 
     #[test]
     fn test_empty_matrices() {
-        let cfg = default_config();
-        for (n_rows, n_cols) in [(0, 0), (0, 4), (4, 0)] {
-            let out = solve_dense(&[], n_rows, n_cols, &cfg).expect("empty matrix should succeed");
-            assert!(out.row_ind.is_empty());
-            assert!(out.col_ind.is_empty());
-            assert_eq!(out.cost, 0.0);
-            assert_eq!(out.iterations, 0);
-            assert_eq!(out.scaling_rounds, 0);
-            assert_eq!(out.final_eps, 0.0);
-            assert_eq!(out.row_prices, vec![0.0; n_rows]);
-            assert_eq!(out.col_prices, vec![0.0; n_cols]);
+        let configs = [
+            default_config(),
+            SolveConfig {
+                cost_limit: Some(10.0),
+                ..default_config()
+            },
+            SolveConfig {
+                cost_limit: Some(f64::NEG_INFINITY),
+                ..default_config()
+            },
+            SolveConfig {
+                maximize: true,
+                cost_limit: Some(-5.0),
+                ..default_config()
+            },
+            SolveConfig {
+                maximize: true,
+                cost_limit: Some(f64::INFINITY),
+                ..default_config()
+            },
+        ];
+        for cfg in &configs {
+            for (n_rows, n_cols) in [(0, 0), (0, 4), (4, 0)] {
+                let out =
+                    solve_dense(&[], n_rows, n_cols, cfg).expect("empty matrix should succeed");
+                assert!(out.row_ind.is_empty());
+                assert!(out.col_ind.is_empty());
+                assert_eq!(out.cost, 0.0);
+                assert_eq!(out.iterations, 0);
+                assert_eq!(out.scaling_rounds, 0);
+                assert_eq!(out.final_eps, 0.0);
+                assert_eq!(out.row_prices, vec![0.0; n_rows]);
+                assert_eq!(out.col_prices, vec![0.0; n_cols]);
+            }
         }
     }
 
@@ -1221,5 +1389,626 @@ mod tests {
             }
             other => panic!("expected Convergence error on ULP stall, got {other:?}"),
         }
+    }
+
+    fn assert_partial_matching(
+        out: &SolveOutput,
+        costs: &[f64],
+        n_rows: usize,
+        n_cols: usize,
+        maximize: bool,
+        limit: f64,
+    ) {
+        assert_eq!(out.row_ind.len(), out.col_ind.len());
+        assert!(out.row_ind.len() <= n_rows.min(n_cols));
+        assert_eq!(out.row_prices.len(), n_rows);
+        assert_eq!(out.col_prices.len(), n_cols);
+
+        let mut seen_cols = vec![false; n_cols];
+        let mut expected_cost = 0.0;
+        let mut abs_sum = 0.0;
+        for i in 0..out.row_ind.len() {
+            let r = out.row_ind[i];
+            let c = out.col_ind[i];
+            assert!(r < n_rows);
+            assert!(c < n_cols);
+            if i > 0 {
+                assert!(out.row_ind[i - 1] < r, "row_ind must be strictly sorted");
+            }
+            assert!(!seen_cols[c], "col_ind must contain unique indices");
+            seen_cols[c] = true;
+
+            let val = costs[r * n_cols + c];
+            assert!(val.is_finite(), "matched cost must be finite, got {val}");
+            if maximize {
+                assert!(val > limit, "matched score {val} must be > limit {limit}");
+            } else {
+                assert!(val < limit, "matched cost {val} must be < limit {limit}");
+            }
+            expected_cost += val;
+            abs_sum += val.abs();
+        }
+        let tol = 1e-12 * abs_sum.max(1.0);
+        assert!(
+            (out.cost - expected_cost).abs() <= tol,
+            "cost mismatch: out.cost={}, expected={expected_cost}",
+            out.cost
+        );
+    }
+
+    fn assert_partial_eps_cs(
+        costs: &[f64],
+        n_rows: usize,
+        n_cols: usize,
+        maximize: bool,
+        limit: f64,
+        out: &SolveOutput,
+    ) {
+        let mut scale = 1.0_f64;
+        for &val in costs {
+            if val.is_finite() {
+                let net = if maximize { val - limit } else { limit - val };
+                if net > 0.0 {
+                    scale = scale.max(net);
+                }
+            }
+        }
+        let tol = 1e-8 * scale;
+
+        let mut row_matched = vec![false; n_rows];
+        let mut col_matched = vec![false; n_cols];
+        for (&r, &c) in out.row_ind.iter().zip(&out.col_ind) {
+            row_matched[r] = true;
+            col_matched[c] = true;
+            let val = costs[r * n_cols + c];
+            let net = if maximize { val - limit } else { limit - val };
+            assert!(
+                (out.row_prices[r] + out.col_prices[c] - net).abs() <= tol,
+                "matched CS violated at ({r}, {c}): {} + {} != {net}",
+                out.row_prices[r],
+                out.col_prices[c]
+            );
+        }
+
+        for (r, &pi_r) in out.row_prices.iter().enumerate() {
+            if !row_matched[r] {
+                assert_eq!(
+                    pi_r, 0.0,
+                    "unassigned row {r} price must be 0.0, got {pi_r}"
+                );
+            }
+            assert!(
+                pi_r >= -out.final_eps - tol,
+                "row {r} price {pi_r} below -final_eps (-{})",
+                out.final_eps
+            );
+        }
+        for (c, &p_c) in out.col_prices.iter().enumerate() {
+            if !col_matched[c] {
+                assert_eq!(p_c, 0.0, "unassigned col {c} price must be 0.0, got {p_c}");
+            }
+            assert!(
+                p_c >= -out.final_eps - tol,
+                "col {c} price {p_c} below -final_eps (-{})",
+                out.final_eps
+            );
+        }
+
+        for r in 0..n_rows {
+            for c in 0..n_cols {
+                let val = costs[r * n_cols + c];
+                if !val.is_finite() {
+                    continue;
+                }
+                let net = if maximize { val - limit } else { limit - val };
+                if net > 0.0 {
+                    assert!(
+                        out.row_prices[r] + out.col_prices[c] >= net - out.final_eps - tol,
+                        "partial eps-CS violated at ({r}, {c}): {} + {} < {net} - {}",
+                        out.row_prices[r],
+                        out.col_prices[c],
+                        out.final_eps
+                    );
+                }
+            }
+        }
+    }
+
+    fn brute_force_best_partial_benefit(
+        costs: &[f64],
+        n_rows: usize,
+        n_cols: usize,
+        maximize: bool,
+        limit: f64,
+    ) -> f64 {
+        fn dfs(
+            row: usize,
+            costs: &[f64],
+            n_rows: usize,
+            n_cols: usize,
+            maximize: bool,
+            limit: f64,
+            used_cols: &mut [bool],
+        ) -> f64 {
+            if row == n_rows {
+                return 0.0;
+            }
+            let mut best = dfs(row + 1, costs, n_rows, n_cols, maximize, limit, used_cols);
+            for col in 0..n_cols {
+                if used_cols[col] {
+                    continue;
+                }
+                let val = costs[row * n_cols + col];
+                if !val.is_finite() {
+                    continue;
+                }
+                let net = if maximize { val - limit } else { limit - val };
+                if net > 0.0 {
+                    used_cols[col] = true;
+                    let candidate =
+                        net + dfs(row + 1, costs, n_rows, n_cols, maximize, limit, used_cols);
+                    if candidate > best {
+                        best = candidate;
+                    }
+                    used_cols[col] = false;
+                }
+            }
+            best
+        }
+
+        let mut used_cols = vec![false; n_cols];
+        dfs(0, costs, n_rows, n_cols, maximize, limit, &mut used_cols)
+    }
+
+    fn net_benefit_sum(
+        out: &SolveOutput,
+        costs: &[f64],
+        n_cols: usize,
+        maximize: bool,
+        limit: f64,
+    ) -> f64 {
+        out.row_ind
+            .iter()
+            .zip(&out.col_ind)
+            .map(|(&r, &c)| {
+                let val = costs[r * n_cols + c];
+                if maximize { val - limit } else { limit - val }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn test_cost_limit_unbounded_vs_empty() {
+        let costs = [4.0, 1.0, 3.0, 2.0, 0.0, 5.0, 3.0, 2.0, 2.0];
+        let min_none = solve_dense(&costs, 3, 3, &default_config()).expect("min None should solve");
+        let min_inf = solve_dense(
+            &costs,
+            3,
+            3,
+            &SolveConfig {
+                cost_limit: Some(f64::INFINITY),
+                ..default_config()
+            },
+        )
+        .expect("min +inf limit should solve");
+        assert_eq!(min_inf.row_ind, min_none.row_ind);
+        assert_eq!(min_inf.col_ind, min_none.col_ind);
+        assert_eq!(min_inf.cost, min_none.cost);
+
+        let min_ninf = solve_dense(
+            &costs,
+            3,
+            3,
+            &SolveConfig {
+                cost_limit: Some(f64::NEG_INFINITY),
+                ..default_config()
+            },
+        )
+        .expect("min -inf limit should return empty");
+        assert!(min_ninf.row_ind.is_empty());
+        assert!(min_ninf.col_ind.is_empty());
+        assert_eq!(min_ninf.cost, 0.0);
+        assert_eq!(min_ninf.iterations, 0);
+        assert_eq!(min_ninf.scaling_rounds, 0);
+        assert_eq!(min_ninf.final_eps, 0.0);
+        assert_eq!(min_ninf.row_prices, vec![0.0; 3]);
+        assert_eq!(min_ninf.col_prices, vec![0.0; 3]);
+
+        let max_none = solve_dense(
+            &costs,
+            3,
+            3,
+            &SolveConfig {
+                maximize: true,
+                ..default_config()
+            },
+        )
+        .expect("max None should solve");
+        let max_ninf = solve_dense(
+            &costs,
+            3,
+            3,
+            &SolveConfig {
+                maximize: true,
+                cost_limit: Some(f64::NEG_INFINITY),
+                ..default_config()
+            },
+        )
+        .expect("max -inf limit should solve");
+        assert_eq!(max_ninf.row_ind, max_none.row_ind);
+        assert_eq!(max_ninf.col_ind, max_none.col_ind);
+        assert_eq!(max_ninf.cost, max_none.cost);
+
+        let max_inf = solve_dense(
+            &costs,
+            3,
+            3,
+            &SolveConfig {
+                maximize: true,
+                cost_limit: Some(f64::INFINITY),
+                ..default_config()
+            },
+        )
+        .expect("max +inf limit should return empty");
+        assert!(max_inf.row_ind.is_empty());
+        assert!(max_inf.col_ind.is_empty());
+        assert_eq!(max_inf.cost, 0.0);
+        assert_eq!(max_inf.iterations, 0);
+        assert_eq!(max_inf.scaling_rounds, 0);
+        assert_eq!(max_inf.final_eps, 0.0);
+        assert_eq!(max_inf.row_prices, vec![0.0; 3]);
+        assert_eq!(max_inf.col_prices, vec![0.0; 3]);
+    }
+
+    #[test]
+    fn test_cost_limit_strict_boundary() {
+        let costs = [5.0, 10.0, 10.0, 5.0];
+
+        let exact_min = solve_dense(
+            &costs,
+            2,
+            2,
+            &SolveConfig {
+                cost_limit: Some(5.0),
+                ..default_config()
+            },
+        )
+        .expect("exact boundary min should succeed with empty matching");
+        assert!(exact_min.row_ind.is_empty());
+        assert!(exact_min.col_ind.is_empty());
+        assert_eq!(exact_min.cost, 0.0);
+        assert_eq!(exact_min.row_prices, vec![0.0; 2]);
+        assert_eq!(exact_min.col_prices, vec![0.0; 2]);
+
+        let just_above_min = solve_dense(
+            &costs,
+            2,
+            2,
+            &SolveConfig {
+                cost_limit: Some(5.01),
+                ..default_config()
+            },
+        )
+        .expect("just above boundary min should match");
+        assert_partial_matching(&just_above_min, &costs, 2, 2, false, 5.01);
+        assert_eq!(just_above_min.row_ind, vec![0, 1]);
+        assert_eq!(just_above_min.col_ind, vec![0, 1]);
+        assert!((just_above_min.cost - 10.0).abs() < 1e-12);
+        assert_partial_eps_cs(&costs, 2, 2, false, 5.01, &just_above_min);
+
+        let exact_max = solve_dense(
+            &costs,
+            2,
+            2,
+            &SolveConfig {
+                maximize: true,
+                cost_limit: Some(10.0),
+                ..default_config()
+            },
+        )
+        .expect("exact boundary max should succeed with empty matching");
+        assert!(exact_max.row_ind.is_empty());
+        assert!(exact_max.col_ind.is_empty());
+        assert_eq!(exact_max.cost, 0.0);
+
+        let just_below_max = solve_dense(
+            &costs,
+            2,
+            2,
+            &SolveConfig {
+                maximize: true,
+                cost_limit: Some(9.99),
+                ..default_config()
+            },
+        )
+        .expect("just below boundary max should match");
+        assert_partial_matching(&just_below_max, &costs, 2, 2, true, 9.99);
+        assert_eq!(just_below_max.row_ind, vec![0, 1]);
+        assert_eq!(just_below_max.col_ind, vec![1, 0]);
+        assert!((just_below_max.cost - 20.0).abs() < 1e-12);
+        assert_partial_eps_cs(&costs, 2, 2, true, 9.99, &just_below_max);
+    }
+
+    #[test]
+    fn test_cost_limit_partial_matching_beats_forced() {
+        let inf = f64::INFINITY;
+        // Track-fusion matrix: rows 0, 1 match cleanly (1.0, 2.0), row 2's only finite edge is 50.0.
+        let fusion = [1.0, inf, inf, inf, 2.0, inf, inf, inf, 50.0];
+        let out_min = solve_dense(
+            &fusion,
+            3,
+            3,
+            &SolveConfig {
+                cost_limit: Some(10.0),
+                ..default_config()
+            },
+        )
+        .expect("partial gated fusion should solve");
+        assert_partial_matching(&out_min, &fusion, 3, 3, false, 10.0);
+        assert_eq!(out_min.row_ind, vec![0, 1]);
+        assert_eq!(out_min.col_ind, vec![0, 1]);
+        assert!((out_min.cost - 3.0).abs() < 1e-12);
+        assert_partial_eps_cs(&fusion, 3, 3, false, 10.0, &out_min);
+
+        // Maximization with negative-reward third track and cost_limit = 0.0
+        let ninf = f64::NEG_INFINITY;
+        let rewards = [10.0, ninf, ninf, ninf, 2.0, ninf, ninf, ninf, -5.0];
+        let out_max = solve_dense(
+            &rewards,
+            3,
+            3,
+            &SolveConfig {
+                maximize: true,
+                cost_limit: Some(0.0),
+                ..default_config()
+            },
+        )
+        .expect("partial max fusion should skip negative-reward match");
+        assert_partial_matching(&out_max, &rewards, 3, 3, true, 0.0);
+        assert_eq!(out_max.row_ind, vec![0, 1]);
+        assert_eq!(out_max.col_ind, vec![0, 1]);
+        assert!((out_max.cost - 12.0).abs() < 1e-12);
+        assert_partial_eps_cs(&rewards, 3, 3, true, 0.0, &out_max);
+    }
+
+    #[test]
+    fn test_cost_limit_rectangular_and_inf() {
+        let inf = f64::INFINITY;
+        let ninf = f64::NEG_INFINITY;
+
+        // 4x2 (tall) with inf entries and finite cost_limit
+        let tall = [2.0, 9.0, 1.0, inf, 8.5, 4.0, inf, 12.0];
+        let limit_tall = 9.0;
+        let out_tall = solve_dense(
+            &tall,
+            4,
+            2,
+            &SolveConfig {
+                cost_limit: Some(limit_tall),
+                ..default_config()
+            },
+        )
+        .expect("4x2 partial should solve");
+        assert_partial_matching(&out_tall, &tall, 4, 2, false, limit_tall);
+        assert_partial_eps_cs(&tall, 4, 2, false, limit_tall, &out_tall);
+        let best_tall = brute_force_best_partial_benefit(&tall, 4, 2, false, limit_tall);
+        let got_tall = net_benefit_sum(&out_tall, &tall, 2, false, limit_tall);
+        assert!(
+            (best_tall - got_tall).abs() <= 4.0 * out_tall.final_eps + 1e-9,
+            "tall optimality gap: best={best_tall}, got={got_tall}"
+        );
+
+        // 2x4 (wide) with inf entries and finite cost_limit
+        let wide = [2.0, 1.0, 8.5, inf, 9.0, inf, 4.0, 12.0];
+        let limit_wide = 9.0;
+        let out_wide = solve_dense(
+            &wide,
+            2,
+            4,
+            &SolveConfig {
+                cost_limit: Some(limit_wide),
+                ..default_config()
+            },
+        )
+        .expect("2x4 partial should solve");
+        assert_partial_matching(&out_wide, &wide, 2, 4, false, limit_wide);
+        assert_partial_eps_cs(&wide, 2, 4, false, limit_wide, &out_wide);
+        let best_wide = brute_force_best_partial_benefit(&wide, 2, 4, false, limit_wide);
+        let got_wide = net_benefit_sum(&out_wide, &wide, 4, false, limit_wide);
+        assert!(
+            (best_wide - got_wide).abs() <= 2.0 * out_wide.final_eps + 1e-9,
+            "wide optimality gap: best={best_wide}, got={got_wide}"
+        );
+
+        // Maximize on 4x2 with -inf and negative scores
+        let tall_max = [8.0, 1.0, 9.0, ninf, 1.5, 6.0, ninf, -2.0];
+        let out_tall_max = solve_dense(
+            &tall_max,
+            4,
+            2,
+            &SolveConfig {
+                maximize: true,
+                cost_limit: Some(1.0),
+                ..default_config()
+            },
+        )
+        .expect("4x2 max partial should solve");
+        assert_partial_matching(&out_tall_max, &tall_max, 4, 2, true, 1.0);
+        assert_partial_eps_cs(&tall_max, 4, 2, true, 1.0, &out_tall_max);
+        let best_tall_max = brute_force_best_partial_benefit(&tall_max, 4, 2, true, 1.0);
+        let got_tall_max = net_benefit_sum(&out_tall_max, &tall_max, 2, true, 1.0);
+        assert!(
+            (best_tall_max - got_tall_max).abs() <= 4.0 * out_tall_max.final_eps + 1e-9,
+            "tall max optimality gap: best={best_tall_max}, got={got_tall_max}"
+        );
+    }
+
+    #[test]
+    fn test_cost_limit_tricky_scaling_and_bruteforce_suite() {
+        let inf = f64::INFINITY;
+        let ninf = f64::NEG_INFINITY;
+
+        // 4x4 with a 3x2 overdemanded equal-cost subblock (must scale rapidly, not spin)
+        let overdemanded = [
+            1.0, 1.0, inf, inf, 1.0, 1.0, inf, inf, 1.0, 1.0, inf, inf, inf, inf, 1.0, inf,
+        ];
+        let out_od = solve_dense(
+            &overdemanded,
+            4,
+            4,
+            &SolveConfig {
+                cost_limit: Some(5.0),
+                ..default_config()
+            },
+        )
+        .expect("overdemanded subblock should solve rapidly");
+        assert_partial_matching(&out_od, &overdemanded, 4, 4, false, 5.0);
+        assert_eq!(out_od.row_ind.len(), 3);
+        assert!((out_od.cost - 3.0).abs() < 1e-12);
+        assert!(out_od.iterations < 200);
+        assert_partial_eps_cs(&overdemanded, 4, 4, false, 5.0, &out_od);
+
+        // Matrix forcing reverse pass to rescue optimal 2-pair matching after round 1
+        // B = [[5.0, 1.0], [5.0, 0.0]] for limit 6.0 -> costs [[1.0, 5.0], [1.0, 6.0]]
+        let reverse_rescue = [1.0, 5.0, 1.0, 6.0];
+        let out_rev = solve_dense(
+            &reverse_rescue,
+            2,
+            2,
+            &SolveConfig {
+                cost_limit: Some(6.0),
+                ..default_config()
+            },
+        )
+        .expect("reverse rescue 2x2 should solve");
+        assert_partial_matching(&out_rev, &reverse_rescue, 2, 2, false, 6.0);
+        assert_eq!(out_rev.row_ind, vec![0, 1]);
+        assert_eq!(out_rev.col_ind, vec![1, 0]);
+        assert!((out_rev.cost - 6.0).abs() < 1e-12);
+        assert_partial_eps_cs(&reverse_rescue, 2, 2, false, 6.0, &out_rev);
+
+        // Deterministic PRNG differential suite against brute force over 1..=5 x 1..=5
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next_u64 = || -> u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for case_idx in 0..80 {
+            let n_rows = ((next_u64() % 5) + 1) as usize;
+            let n_cols = ((next_u64() % 5) + 1) as usize;
+            let maximize = case_idx % 2 == 1;
+            let limit = ((next_u64() % 21) as f64) - 10.0;
+            let mut costs = Vec::with_capacity(n_rows * n_cols);
+            for _ in 0..(n_rows * n_cols) {
+                let r = next_u64() % 10;
+                if r < 3 {
+                    costs.push(if maximize { ninf } else { inf });
+                } else if r == 3 {
+                    // Exact boundary entry
+                    costs.push(limit);
+                } else {
+                    let v = ((next_u64() % 25) as f64) - 12.0;
+                    costs.push(v);
+                }
+            }
+
+            let out = solve_dense(
+                &costs,
+                n_rows,
+                n_cols,
+                &SolveConfig {
+                    maximize,
+                    cost_limit: Some(limit),
+                    ..default_config()
+                },
+            )
+            .expect("random small partial matrix should solve");
+            assert_partial_matching(&out, &costs, n_rows, n_cols, maximize, limit);
+            assert_partial_eps_cs(&costs, n_rows, n_cols, maximize, limit, &out);
+
+            let best = brute_force_best_partial_benefit(&costs, n_rows, n_cols, maximize, limit);
+            let got = net_benefit_sum(&out, &costs, n_cols, maximize, limit);
+            assert!(
+                (best - got).abs() <= (n_rows.min(n_cols) as f64) * out.final_eps + 1e-9,
+                "case {case_idx} ({n_rows}x{n_cols}, max={maximize}, limit={limit}): best={best}, got={got}"
+            );
+        }
+
+        // ULP stagnation in partial mode with huge net benefit and tiny eps_min
+        let ulp_partial = [0.0, 1e12, 0.0, 1e12];
+        let res = solve_dense(
+            &ulp_partial,
+            2,
+            2,
+            &SolveConfig {
+                cost_limit: Some(2e12),
+                eps_min: Some(1e-20),
+                ..default_config()
+            },
+        );
+        assert!(
+            matches!(res, Err(SolverError::Convergence { .. })),
+            "expected Convergence on partial ULP stall, got {res:?}"
+        );
+
+        // Larger sparse gated partial instances (15x15, 20x8, 8x20) checking dual eps-CS
+        for (n_rows, n_cols, maximize, limit) in [
+            (15, 15, false, 3.5),
+            (20, 8, false, 0.0),
+            (8, 20, true, -2.5),
+        ] {
+            let mut large = Vec::with_capacity(n_rows * n_cols);
+            for _ in 0..(n_rows * n_cols) {
+                if next_u64() % 4 == 0 {
+                    large.push(if maximize { ninf } else { inf });
+                } else {
+                    let v = ((next_u64() % 400) as f64) * 0.05 - 10.0;
+                    large.push(v);
+                }
+            }
+            let out_large = solve_dense(
+                &large,
+                n_rows,
+                n_cols,
+                &SolveConfig {
+                    maximize,
+                    cost_limit: Some(limit),
+                    ..default_config()
+                },
+            )
+            .expect("larger sparse partial matrix should solve");
+            assert_partial_matching(&out_large, &large, n_rows, n_cols, maximize, limit);
+            assert_partial_eps_cs(&large, n_rows, n_cols, maximize, limit, &out_large);
+        }
+
+        // Unbounded-benefit infinity still rejected even with finite cost_limit
+        assert!(matches!(
+            solve_dense(
+                &[1.0, ninf, 2.0, 3.0],
+                2,
+                2,
+                &SolveConfig {
+                    cost_limit: Some(10.0),
+                    ..default_config()
+                }
+            ),
+            Err(SolverError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            solve_dense(
+                &[1.0, inf, 2.0, 3.0],
+                2,
+                2,
+                &SolveConfig {
+                    maximize: true,
+                    cost_limit: Some(0.0),
+                    ..default_config()
+                }
+            ),
+            Err(SolverError::InvalidInput(_))
+        ));
     }
 }
