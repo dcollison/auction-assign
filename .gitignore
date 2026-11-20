@@ -1,11 +1,26 @@
-target/
-.venv/
-dist/
-*.egg-info/
+# Python-generated files
 __pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+*.pyd
+*.so
+
+# Rust build artifacts
+target/
+
+# Virtual environments
+.venv/
+
+# Test and lint caches
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .superpowers/
-*.pyd
-*.so
+
+# Documentation & coverage builds
+site/
+.coverage
+htmlcov/

@@ -7,11 +7,17 @@ name = "auction-assign"
 version = "0.1.1"
 description = "Fast Bertsekas auction algorithm for linear sum assignment in Rust with Python bindings"
 readme = "README.md"
+authors = [
+    { name = "Dale Collison", email = "dale.a.collison@gmail.com" },
+]
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = ["numpy>=1.24"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -21,12 +27,15 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Mathematics",
+    "Typing :: Typed",
 ]
 
 [project.urls]
 Homepage = "https://github.com/dcollison/auction-assign"
+Documentation = "https://dcollison.github.io/auction-assign/"
 Repository = "https://github.com/dcollison/auction-assign"
 Issues = "https://github.com/dcollison/auction-assign/issues"
+Changelog = "https://github.com/dcollison/auction-assign/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = [
@@ -36,6 +45,13 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "maturin>=1.9,<2.0",
+    "pre-commit>=4.6.2",
+    "pre-commit-uv>=4.3.0",
+]
+docs = [
+    "mkdocs>=1.6.1",
+    "mkdocs-material>=9.7.7",
+    "mkdocstrings[python]>=1.0.6",
 ]
 
 [tool.maturin]
@@ -54,13 +70,16 @@ cache-keys = [
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+extend-exclude = ["docs/superpowers"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP", "NPY"]
+select = ["E", "F", "W", "I", "B", "UP", "NPY"]
 
 [tool.mypy]
 python_version = "3.10"
 strict = true
+warn_return_any = true
+warn_unused_configs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
