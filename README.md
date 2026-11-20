@@ -1,6 +1,12 @@
 # auction-assign
 
-Fast Bertsekas epsilon-scaling forward-reverse auction algorithm for dense linear sum assignment in Rust with Python bindings.
+[![CI](https://github.com/dcollison/auction-assign/actions/workflows/ci.yml/badge.svg)](https://github.com/dcollison/auction-assign/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-mkdocs--material-blue)](https://dcollison.github.io/auction-assign/)
+[![PyPI](https://img.shields.io/pypi/v/auction-assign)](https://pypi.org/project/auction-assign/)
+[![Python](https://img.shields.io/pypi/pyversions/auction-assign)](https://pypi.org/project/auction-assign/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+Fast Bertsekas epsilon-scaling forward-reverse auction algorithm for linear sum assignment in Rust with Python bindings.
 
 ## Features
 
@@ -125,11 +131,22 @@ uv run python benchmarks/bench_assign.py --quick
 
 Both modes verify solution optimality against SciPy for every benchmark case (`PASS`/`FAIL`).
 
-## Local Development
+## Documentation
+
+Full documentation, user guides, and API reference are published at [dcollison.github.io/auction-assign](https://dcollison.github.io/auction-assign/).
+
+To preview the documentation site locally:
+
+```bash
+uv sync --group docs
+uv run --group docs mkdocs serve
+```
+
+## Development
 
 ```bash
 # Create/sync virtualenv and build the Rust extension
-uv sync
+uv sync --all-groups
 
 # Run Python test suite
 uv run pytest -v
@@ -141,31 +158,29 @@ cargo test
 
 # Run Python lint, format check, and strict type checking
 uv run ruff check .
-uv run ruff format --check python tests benchmarks
+uv run ruff format --check .
 uv run mypy python tests benchmarks
+
+# Verify strict MkDocs build
+uv run --group docs mkdocs build --strict
 
 # Build wheel and sdist into dist/
 uv build
 ```
 
-## Releasing (PyPI Trusted Publishing)
+## Releasing
 
-Releases are automated by [`.github/workflows/release.yml`](.github/workflows/release.yml) using PyPI OIDC Trusted Publishing (`id-token: write` with `pypa/gh-action-pypi-publish@release/v1`), so no long-lived PyPI API tokens are stored in repository secrets.
+Releases are automated by [`.github/workflows/release.yml`](.github/workflows/release.yml) using PyPI OIDC Trusted Publishing (`id-token: write` with `pypa/gh-action-pypi-publish@release/v1`), triggered when a GitHub Release is published.
 
 One-time repository and PyPI setup:
 
-1. In your GitHub repository, go to **Settings → Environments** and create an environment named `release` (optionally configure required reviewers or branch/tag protection rules).
+1. In your GitHub repository, go to **Settings → Environments** and create an environment named `pypi` (optionally configure required reviewers or branch/tag protection rules).
 2. On [PyPI](https://pypi.org/), go to **Your Account → Publishing** (or your project's **Publishing** settings) and add a **GitHub** Trusted Publisher with:
    - **Owner**: `dcollison`
    - **Repository name**: `auction-assign`
    - **Workflow name**: `release.yml`
-   - **Environment name**: `release`
-3. Tag a release matching `v*` and push it to GitHub:
-   ```bash
-   git tag v0.1.0
-   git push origin v0.1.0
-   ```
-   You can also test wheel builds and smoke tests without publishing by triggering the **Release** workflow manually via `workflow_dispatch`.
+   - **Environment name**: `pypi`
+3. Update the package version and `CHANGELOG.md`, tag the commit (`vX.Y.Z`), push the tag, and publish a GitHub Release. You can also test wheel builds and smoke tests without publishing by triggering the **Release** workflow manually via `workflow_dispatch`.
 
 ## License
 
