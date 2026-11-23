@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.2] - 2026-11-23
 
 ### Added
 - MkDocs Material documentation (`mkdocs.yml`, `docs/`) with `mkdocstrings` API reference and GitHub Pages deployment workflow (`.github/workflows/docs.yml`).
@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Aligned Python baseline to `3.14`, `pyproject.toml` metadata/URLs/classifiers, CI matrix across Python `3.10`–`3.14` and `ubuntu`/`windows`/`macos`, and PyPI release workflow (`release: [published]`, `pypi` environment).
+- Upgraded locked dependencies in `uv.lock` (`backrefs`, `certifi`, `charset-normalizer`, `filelock`, `pymdown-extensions`, `pyyaml`, `virtualenv`, `watchdog`).
 
 ## [0.1.1] - 2026-11-18
 
